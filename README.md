@@ -32,16 +32,50 @@ To install manually, copy or symlink `ccode` (Linux) or `ccode-macos`
 ### Choosing what to expose read-write
 
 By default the sandbox bind-mounts `~/src` rw, so the agent can hop between
-checkouts. Two env vars let you tighten or relocate this:
+checkouts. Two env vars and a config file let you tighten or relocate this.
+The current working directory is always exposed rw regardless.
 
-- `CCODE_SRC=/path/to/tree` — use a different root than `~/src`.
+- `CCODE_SRC=/path/to/tree` — use a different root than `~/src`. Separate
+  several trees with `:` to expose them all rw.
 - `CCODE_CWD_ONLY=1` — expose **only** the current working directory rw,
-  nothing else under `~/src`. Smaller blast radius if the agent goes off the
-  rails; the cost is no cross-repo work in that session.
+  nothing else. Smaller blast radius if the agent goes off the rails; the cost
+  is no cross-repo work in that session.
 - `CCODE_EXTRA_BIN_DIR=/path/to/dir` — expose a directory of host binaries
   inside the sandbox, read-only and prepended to `PATH`. Useful for personal
   tools in `~/bin` that the agent should be able to invoke. Tilde is expanded
   so `~/bin/sandbox` works from `.zshenv`.
+
+#### Config file (`~/.config/ccode`)
+
+For a persistent, per-checkout setup, drop a config file at `~/.config/ccode`
+(or `$XDG_CONFIG_HOME/ccode`). It is a small declarative INI-ish format — it is
+**parsed, never sourced**, so it cannot execute code. Top-level keys are global
+defaults; a `[<dir>]` section applies only when `ccode` is launched from within
+`<dir>`, so different checkouts can expose different sets of trees. Lists are
+expressed by repeating `SRC`. A leading `~` is expanded.
+
+```ini
+# global default, used when no section matches the cwd
+SRC = ~/src
+CWD_ONLY = 0
+
+[~/firefox]            # active when cwd is at or below ~/firefox
+SRC = ~/firefox
+SRC = ~/depot_tools
+
+[~/work/clientA]
+SRC = ~/work/clientA
+CWD_ONLY = 1           # ignore SRC here, expose only the cwd
+```
+
+The most specific (longest-path) matching section wins, and its keys override
+the global ones. A configured tree that doesn't exist is skipped with a warning
+rather than aborting the launch.
+
+**Precedence**, highest first: `CCODE_CWD_ONLY` / `CCODE_SRC` env vars → the
+matching config section → the global config keys → the built-in `~/src`
+default. An explicit `CCODE_SRC` implies `CWD_ONLY=0` (you named the trees you
+want), unless you also set `CCODE_CWD_ONLY` explicitly.
 
 ### Opening URLs in the host browser
 

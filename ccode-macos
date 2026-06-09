@@ -29,17 +29,170 @@ while [[ -L "$_self" ]]; do
 done
 REPO_DIR="$(cd "$(dirname "$_self")" && pwd)"
 
-# Source tree exposed read-write to the sandbox. Override with CCODE_SRC if
-# your checkouts live elsewhere. Set CCODE_CWD_ONLY=1 to expose only the
-# current working directory instead of the whole tree — tighter blast radius
-# at the cost of cross-repo work.
-SRC="${CCODE_SRC:-$HOME/src}"
 CWD="$(pwd)"
-if [[ "${CCODE_CWD_ONLY:-0}" == "1" ]]; then
-    RW_ROOT="$CWD"
-else
-    RW_ROOT="$SRC"
+
+# --- Read-write source trees exposed to the sandbox ------------------------
+#
+# What gets exposed rw is resolved from (highest precedence first):
+#   1. CCODE_SRC / CCODE_CWD_ONLY environment variables
+#   2. the config file ~/.config/ccode (or $XDG_CONFIG_HOME/ccode)
+#   3. the built-in default $HOME/src
+#
+# The config file is a small declarative INI-ish format. It is parsed, never
+# sourced, so it cannot run code. Top-level keys are global defaults; a
+# [<dir>] section applies only when ccode is launched from within <dir>, so
+# different checkouts can expose different sets of trees. List SRC more than
+# once to expose several trees rw at once. Lines after a '#' are comments.
+# Example:
+#
+#     # global default, used when no section matches the cwd
+#     SRC = ~/src
+#     CWD_ONLY = 0
+#
+#     [~/firefox]            # active when cwd is at or below ~/firefox
+#     SRC = ~/firefox
+#     SRC = ~/depot_tools
+#
+#     [~/work/clientA]
+#     SRC = ~/work/clientA
+#     CWD_ONLY = 1           # ignore SRC here, expose only the cwd
+#
+# The most specific (longest-path) matching section wins; its keys override
+# the global ones. CWD_ONLY=1 drops all SRC trees, exposing only the cwd — a
+# tighter blast radius at the cost of cross-repo work. The cwd is always rw
+# regardless. CCODE_SRC may list several trees separated by ':'.
+
+# Expand a leading ~ or ~/ to $HOME so the config stays portable. We pattern
+# match rather than eval, so no other shell expansion happens on config values.
+_expand_tilde() {
+    case "$1" in
+        "~")   printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s\n' "$HOME/${1#\~/}" ;;
+        *)     printf '%s\n' "$1" ;;
+    esac
+}
+
+_ccode_config="${XDG_CONFIG_HOME:-$HOME/.config}/ccode"
+_cfg_src=()              # SRC list from the winning section
+_cfg_global_src=()       # SRC list from the top-level (no section)
+_cfg_cwd_only=""         # CWD_ONLY from the winning section ("" = unset)
+_cfg_global_cwd_only=""  # CWD_ONLY from the top-level
+if [[ -f "$_ccode_config" ]]; then
+    # Pass 1: find the most specific section whose path contains the cwd.
+    _best_section=""
+    _best_len=-1
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line%%#*}"                        # strip comment
+        _line="${_line#"${_line%%[![:space:]]*}"}"  # ltrim
+        _line="${_line%"${_line##*[![:space:]]}"}"  # rtrim
+        [[ -z "$_line" ]] && continue
+        if [[ "$_line" == \[*\] ]]; then
+            _hdr="${_line#\[}"; _hdr="${_hdr%\]}"
+            _hdr="$(_expand_tilde "$_hdr")"; _hdr="${_hdr%/}"
+            if [[ "$CWD" == "$_hdr" || "$CWD" == "$_hdr"/* ]] \
+               && (( ${#_hdr} > _best_len )); then
+                _best_section="$_hdr"; _best_len=${#_hdr}
+            fi
+        fi
+    done < "$_ccode_config"
+
+    # Pass 2: collect keys for the global scope and the winning section.
+    _section=""           # "" = global (lines before the first section)
+    _in_winner=false
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line%%#*}"
+        _line="${_line#"${_line%%[![:space:]]*}"}"
+        _line="${_line%"${_line##*[![:space:]]}"}"
+        [[ -z "$_line" ]] && continue
+        if [[ "$_line" == \[*\] ]]; then
+            _hdr="${_line#\[}"; _hdr="${_hdr%\]}"
+            _section="$(_expand_tilde "$_hdr")"; _section="${_section%/}"
+            [[ -n "$_best_section" && "$_section" == "$_best_section" ]] \
+                && _in_winner=true || _in_winner=false
+            continue
+        fi
+        [[ "$_line" != *=* ]] && continue
+        _key="${_line%%=*}"; _val="${_line#*=}"
+        _key="${_key%"${_key##*[![:space:]]}"}"     # rtrim key
+        _val="${_val#"${_val%%[![:space:]]*}"}"     # ltrim value
+        _val="${_val%\"}"; _val="${_val#\"}"        # strip surrounding quotes
+        _val="${_val%\'}"; _val="${_val#\'}"
+        case "$_key" in
+            SRC)
+                _val="$(_expand_tilde "$_val")"
+                if [[ -z "$_section" ]]; then
+                    _cfg_global_src+=("$_val")
+                elif [[ "$_in_winner" == true ]]; then
+                    _cfg_src+=("$_val")
+                fi
+                ;;
+            CWD_ONLY)
+                if [[ -z "$_section" ]]; then
+                    _cfg_global_cwd_only="$_val"
+                elif [[ "$_in_winner" == true ]]; then
+                    _cfg_cwd_only="$_val"
+                fi
+                ;;
+        esac
+    done < "$_ccode_config"
 fi
+
+# Resolve CWD_ONLY: env CCODE_CWD_ONLY > (explicit CCODE_SRC implies 0) >
+# winning section > global > 0. An explicitly-passed CCODE_SRC names the trees
+# you want, so it overrides a config-file CWD_ONLY (but not an explicit
+# CCODE_CWD_ONLY, which stays authoritative when you set both).
+if [[ -n "${CCODE_CWD_ONLY:-}" ]]; then
+    _cwd_only="$CCODE_CWD_ONLY"
+elif [[ -n "${CCODE_SRC:-}" ]]; then
+    _cwd_only="0"
+elif [[ -n "$_cfg_cwd_only" ]]; then
+    _cwd_only="$_cfg_cwd_only"
+else
+    _cwd_only="${_cfg_global_cwd_only:-0}"
+fi
+
+# Resolve the rw source trees: env > winning section > global > default.
+# CWD_ONLY short-circuits to nothing here; the cwd is appended below.
+RW_ROOTS=()
+if [[ "$_cwd_only" == "1" ]]; then
+    :
+elif [[ -n "${CCODE_SRC:-}" ]]; then
+    IFS=':' read -r -a RW_ROOTS <<< "$CCODE_SRC"
+elif (( ${#_cfg_src[@]} > 0 )); then
+    RW_ROOTS=("${_cfg_src[@]}")
+elif (( ${#_cfg_global_src[@]} > 0 )); then
+    RW_ROOTS=("${_cfg_global_src[@]}")
+else
+    RW_ROOTS=("$HOME/src")
+fi
+# The cwd is always rw regardless of the above. Appended last so that when it
+# nests under an SRC tree its subpath rule is a harmless overlap.
+RW_ROOTS+=("$CWD")
+
+# Build the rw subpath rules for the sandbox profile, deduplicating by
+# normalised path and skipping (with a warning) any configured tree that does
+# not exist — a typo in one entry should not block the whole launch. Paths are
+# referenced as-given (only normalised for the dedup compare) so the cwd
+# inside the sandbox matches the launching cwd. macOS's BSD `realpath` only
+# resolves existing paths, so the existence check has to come first.
+_rw_paths=()             # deduped, existing paths — used for noexec cleanup
+_rw_subpath_lines=""     # interpolated into the SBPROFILE heredoc below
+_seen_roots=()
+for _root in "${RW_ROOTS[@]}"; do
+    if [[ ! -e "$_root" ]]; then
+        echo "ccode: warning: rw path does not exist, skipping: $_root" >&2
+        continue
+    fi
+    _norm="$(realpath "$_root")"
+    _dup=false
+    for _s in ${_seen_roots[@]+"${_seen_roots[@]}"}; do
+        [[ "$_s" == "$_norm" ]] && { _dup=true; break; }
+    done
+    [[ "$_dup" == true ]] && continue
+    _seen_roots+=("$_norm")
+    _rw_paths+=("$_root")
+    _rw_subpath_lines+=$'\n'"  (subpath \"$_root\")"
+done
 
 # Sandbox-private homes for language toolchains. macOS has no bind-mount
 # equivalent, so we redirect each toolchain via its own env var
@@ -101,9 +254,9 @@ fi
 _SANDBOX_PATH="$SBX/cargo/bin:$HOME/.cargo/bin:$HOME/.local/bin:$SBX/npm-prefix/bin:$REPO_DIR/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 [[ -n "${CCODE_EXTRA_BIN_DIR:-}" ]] && _SANDBOX_PATH="${CCODE_EXTRA_BIN_DIR}:${_SANDBOX_PATH}"
 
-# Build the sandbox profile (SBPL). $HOME / $RW_ROOT / $SBX are interpolated
-# by the shell into Scheme string literals — assumes paths contain no `"' or
-# `\' (true for normal Unix paths).
+# Build the sandbox profile (SBPL). $HOME / $SBX / the rw subpath lines are
+# interpolated by the shell into Scheme string literals — assumes paths
+# contain no `"' or `\' (true for normal Unix paths).
 PROFILE=$(cat <<SBPROFILE
 (version 1)
 (deny default)
@@ -246,10 +399,11 @@ PROFILE=$(cat <<SBPROFILE
 ;; --- Read-write paths ---
 ;; ~/.claude and ~/.claude.json are rw-shared with host. A compromised
 ;; sandbox can edit settings, hooks, skills or MCP entries that the host
+;;
+;; The (subpath …) lines for the rw source trees plus the cwd come from
+;; \$_rw_subpath_lines (see the SRC/CWD_ONLY config docs near the top).
 (allow file-read* file-write*
-  (literal "$HOME/.moz-phab-config")
-  (subpath "$RW_ROOT")
-  (subpath "$CWD")
+  (literal "$HOME/.moz-phab-config")$_rw_subpath_lines
   (subpath "$HOME/.claude")
   (literal "$HOME/.claude.json")
   (subpath "$HOME/.mozbuild")
@@ -343,7 +497,7 @@ fi
 if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     _mbpath="$(realpath -m "$MOZBUILD_STATE_PATH")"
     _mapped=false
-    for _prefix in "$HOME/.mozbuild" "$RW_ROOT" "$CWD"; do
+    for _prefix in "$HOME/.mozbuild" "${RW_ROOTS[@]}"; do
         if [[ "$_mbpath" == "$(realpath -m "$_prefix")"* ]]; then
             _mapped=true
             break
@@ -351,7 +505,7 @@ if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     done
     if [[ "$_mapped" == false ]]; then
         echo "error: destination of MOZBUILD_STATE_PATH=$MOZBUILD_STATE_PATH is outside the sandbox." >&2
-        echo "It must be under one of: ~/.mozbuild, $RW_ROOT, or $CWD" >&2
+        echo "It must be under one of: ~/.mozbuild, ${RW_ROOTS[*]}" >&2
         exit 1
     fi
     ENV_ARGS+=(MOZBUILD_STATE_PATH="$MOZBUILD_STATE_PATH")
@@ -369,12 +523,12 @@ if [[ "${1:-}" == "--print-profile" ]]; then
     exit 0
 fi
 
-# Opt-in host-side noexec: with CCODE_NOEXEC=1, any file under $RW_ROOT
-# that gains +x (or is created with +x) during the sandbox session has
-# the execute bit stripped on exit. This is the macOS equivalent of the
-# Linux `bwrap`-on-host-with-MS_NOEXEC trick — we can't bind-mount on
-# macOS, so we detect-and-strip instead of mount-with-noexec. Files that
-# already had +x before launch are left alone (mtime-based diff).
+# Opt-in host-side noexec: with CCODE_NOEXEC=1, any file under the rw
+# source trees that gains +x (or is created with +x) during the sandbox
+# session has the execute bit stripped on exit. This is the macOS
+# equivalent of the Linux `bwrap`-on-host-with-MS_NOEXEC trick — we can't
+# bind-mount on macOS, so we detect-and-strip instead of mount-with-noexec.
+# Files that already had +x before launch are left alone (mtime-based diff).
 NOEXEC_MARKER=""
 if [[ "${CCODE_NOEXEC:-0}" == "1" ]]; then
     NOEXEC_MARKER="$SBX/noexec-marker-$$"
@@ -388,13 +542,15 @@ cleanup() {
     if [[ -n "$NOEXEC_MARKER" && -f "$NOEXEC_MARKER" ]]; then
         # find: files newer than the marker that currently have any x bit set,
         # then chmod a-x. -perm +ugo+x matches if ANY x bit is set. The `+`
-        # batches into single chmod invocations for speed.
+        # batches into single chmod invocations for speed. All deduplicated
+        # rw trees are walked; when one nests under another the overlap just
+        # means find revisits the same files (chmod a-x is idempotent).
         local count
-        count=$(/usr/bin/find "$RW_ROOT" -type f -newer "$NOEXEC_MARKER" \
+        count=$(/usr/bin/find "${_rw_paths[@]}" -type f -newer "$NOEXEC_MARKER" \
                     -perm +ugo+x 2>/dev/null | /usr/bin/wc -l | /usr/bin/tr -d ' ')
         if [[ "$count" -gt 0 ]]; then
             echo "ccode: noexec — stripping +x from $count file(s) modified during session" >&2
-            /usr/bin/find "$RW_ROOT" -type f -newer "$NOEXEC_MARKER" \
+            /usr/bin/find "${_rw_paths[@]}" -type f -newer "$NOEXEC_MARKER" \
                 -perm +ugo+x -exec /bin/chmod a-x {} + 2>/dev/null
         fi
         rm -f "$NOEXEC_MARKER"

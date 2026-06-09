@@ -24,17 +24,167 @@ while [[ -L "$_self" ]]; do
 done
 REPO_DIR="$(cd "$(dirname "$_self")" && pwd)"
 
-# Source tree exposed read-write to the sandbox. Override with CCODE_SRC if
-# your checkouts live elsewhere. Set CCODE_CWD_ONLY=1 to expose only the
-# current working directory instead of the whole tree — tighter blast radius
-# at the cost of cross-repo work.
-SRC="${CCODE_SRC:-$HOME/src}"
 CWD="$(pwd)"
-if [[ "${CCODE_CWD_ONLY:-0}" == "1" ]]; then
-    RW_ROOT="$CWD"
-else
-    RW_ROOT="$SRC"
+
+# --- Read-write source trees exposed to the sandbox ------------------------
+#
+# What gets bind-mounted rw is resolved from (highest precedence first):
+#   1. CCODE_SRC / CCODE_CWD_ONLY environment variables
+#   2. the config file ~/.config/ccode (or $XDG_CONFIG_HOME/ccode)
+#   3. the built-in default $HOME/src
+#
+# The config file is a small declarative INI-ish format. It is parsed, never
+# sourced, so it cannot run code. Top-level keys are global defaults; a
+# [<dir>] section applies only when ccode is launched from within <dir>, so
+# different checkouts can expose different sets of trees. List SRC more than
+# once to expose several trees rw at once. Lines after a '#' are comments.
+# Example:
+#
+#     # global default, used when no section matches the cwd
+#     SRC = ~/src
+#     CWD_ONLY = 0
+#
+#     [~/firefox]            # active when cwd is at or below ~/firefox
+#     SRC = ~/firefox
+#     SRC = ~/depot_tools
+#
+#     [~/work/clientA]
+#     SRC = ~/work/clientA
+#     CWD_ONLY = 1           # ignore SRC here, expose only the cwd
+#
+# The most specific (longest-path) matching section wins; its keys override
+# the global ones. CWD_ONLY=1 drops all SRC trees, exposing only the cwd — a
+# tighter blast radius at the cost of cross-repo work. The cwd is always rw
+# regardless. CCODE_SRC may list several trees separated by ':'.
+
+# Expand a leading ~ or ~/ to $HOME so the config stays portable. We pattern
+# match rather than eval, so no other shell expansion happens on config values.
+_expand_tilde() {
+    case "$1" in
+        "~")   printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s\n' "$HOME/${1#\~/}" ;;
+        *)     printf '%s\n' "$1" ;;
+    esac
+}
+
+_ccode_config="${XDG_CONFIG_HOME:-$HOME/.config}/ccode"
+_cfg_src=()              # SRC list from the winning section
+_cfg_global_src=()       # SRC list from the top-level (no section)
+_cfg_cwd_only=""         # CWD_ONLY from the winning section ("" = unset)
+_cfg_global_cwd_only=""  # CWD_ONLY from the top-level
+if [[ -f "$_ccode_config" ]]; then
+    # Pass 1: find the most specific section whose path contains the cwd.
+    _best_section=""
+    _best_len=-1
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line%%#*}"                        # strip comment
+        _line="${_line#"${_line%%[![:space:]]*}"}"  # ltrim
+        _line="${_line%"${_line##*[![:space:]]}"}"  # rtrim
+        [[ -z "$_line" ]] && continue
+        if [[ "$_line" == \[*\] ]]; then
+            _hdr="${_line#\[}"; _hdr="${_hdr%\]}"
+            _hdr="$(_expand_tilde "$_hdr")"; _hdr="${_hdr%/}"
+            if [[ "$CWD" == "$_hdr" || "$CWD" == "$_hdr"/* ]] \
+               && (( ${#_hdr} > _best_len )); then
+                _best_section="$_hdr"; _best_len=${#_hdr}
+            fi
+        fi
+    done < "$_ccode_config"
+
+    # Pass 2: collect keys for the global scope and the winning section.
+    _section=""           # "" = global (lines before the first section)
+    _in_winner=false
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line%%#*}"
+        _line="${_line#"${_line%%[![:space:]]*}"}"
+        _line="${_line%"${_line##*[![:space:]]}"}"
+        [[ -z "$_line" ]] && continue
+        if [[ "$_line" == \[*\] ]]; then
+            _hdr="${_line#\[}"; _hdr="${_hdr%\]}"
+            _section="$(_expand_tilde "$_hdr")"; _section="${_section%/}"
+            [[ -n "$_best_section" && "$_section" == "$_best_section" ]] \
+                && _in_winner=true || _in_winner=false
+            continue
+        fi
+        [[ "$_line" != *=* ]] && continue
+        _key="${_line%%=*}"; _val="${_line#*=}"
+        _key="${_key%"${_key##*[![:space:]]}"}"     # rtrim key
+        _val="${_val#"${_val%%[![:space:]]*}"}"     # ltrim value
+        _val="${_val%\"}"; _val="${_val#\"}"        # strip surrounding quotes
+        _val="${_val%\'}"; _val="${_val#\'}"
+        case "$_key" in
+            SRC)
+                _val="$(_expand_tilde "$_val")"
+                if [[ -z "$_section" ]]; then
+                    _cfg_global_src+=("$_val")
+                elif [[ "$_in_winner" == true ]]; then
+                    _cfg_src+=("$_val")
+                fi
+                ;;
+            CWD_ONLY)
+                if [[ -z "$_section" ]]; then
+                    _cfg_global_cwd_only="$_val"
+                elif [[ "$_in_winner" == true ]]; then
+                    _cfg_cwd_only="$_val"
+                fi
+                ;;
+        esac
+    done < "$_ccode_config"
 fi
+
+# Resolve CWD_ONLY: env CCODE_CWD_ONLY > (explicit CCODE_SRC implies 0) >
+# winning section > global > 0. An explicitly-passed CCODE_SRC names the trees
+# you want, so it overrides a config-file CWD_ONLY (but not an explicit
+# CCODE_CWD_ONLY, which stays authoritative when you set both).
+if [[ -n "${CCODE_CWD_ONLY:-}" ]]; then
+    _cwd_only="$CCODE_CWD_ONLY"
+elif [[ -n "${CCODE_SRC:-}" ]]; then
+    _cwd_only="0"
+elif [[ -n "$_cfg_cwd_only" ]]; then
+    _cwd_only="$_cfg_cwd_only"
+else
+    _cwd_only="${_cfg_global_cwd_only:-0}"
+fi
+
+# Resolve the rw source trees: env > winning section > global > default.
+# CWD_ONLY short-circuits to nothing here; the cwd is appended below.
+RW_ROOTS=()
+if [[ "$_cwd_only" == "1" ]]; then
+    :
+elif [[ -n "${CCODE_SRC:-}" ]]; then
+    IFS=':' read -r -a RW_ROOTS <<< "$CCODE_SRC"
+elif (( ${#_cfg_src[@]} > 0 )); then
+    RW_ROOTS=("${_cfg_src[@]}")
+elif (( ${#_cfg_global_src[@]} > 0 )); then
+    RW_ROOTS=("${_cfg_global_src[@]}")
+else
+    RW_ROOTS=("$HOME/src")
+fi
+# The cwd is always rw regardless of the above. Appended last so that when it
+# nests under an SRC tree its bind is a harmless no-op overlay on top.
+RW_ROOTS+=("$CWD")
+
+# Build the rw bind-mount args, deduplicating by normalised path and skipping
+# (with a warning) any configured tree that does not exist — a typo in one
+# entry should not block the whole launch. Paths are bound as-given (only
+# normalised for the dedup compare) so the cwd inside the sandbox matches the
+# launching cwd; bwrap does not --chdir.
+_rw_bind_args=()
+_seen_roots=()
+for _root in "${RW_ROOTS[@]}"; do
+    _norm="$(realpath -m "$_root")"
+    _dup=false
+    for _s in ${_seen_roots[@]+"${_seen_roots[@]}"}; do
+        [[ "$_s" == "$_norm" ]] && { _dup=true; break; }
+    done
+    [[ "$_dup" == true ]] && continue
+    _seen_roots+=("$_norm")
+    if [[ ! -e "$_root" ]]; then
+        echo "ccode: warning: rw path does not exist, skipping: $_root" >&2
+        continue
+    fi
+    _rw_bind_args+=(--bind "$_root" "$_root")
+done
 
 # Sandbox-private homes for language toolchains. The host's caches are NOT
 # shared into the sandbox: a compromised agent must not be able to drop a
@@ -135,11 +285,9 @@ args=(
 
     # --- Read-write paths ---
     --bind "$HOME/.moz-phab-config"   "$HOME/.moz-phab-config"
-    # Source tree (default $HOME/src, see SRC/CCODE_CWD_ONLY at top).
-    # cwd is always rw regardless of CCODE_CWD_ONLY; when cwd is under
-    # RW_ROOT the second bind is a no-op overlay.
-    --bind "$RW_ROOT"                 "$RW_ROOT"
-    --bind "$CWD"                     "$CWD"
+    # Read-write source trees plus the cwd, resolved above into _rw_bind_args
+    # (see the SRC/CWD_ONLY config docs near the top of the script).
+    "${_rw_bind_args[@]}"
     --bind "$HOME/.claude"            "$HOME/.claude"
     --bind "$HOME/.claude.json"       "$HOME/.claude.json"
     --bind "$HOME/.local/share/rr"    "$HOME/.local/share/rr"
@@ -226,7 +374,7 @@ fi
 if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     _mbpath="$(realpath -m "$MOZBUILD_STATE_PATH")"
     _mapped=false
-    for _prefix in "$HOME/.mozbuild" "$RW_ROOT" "$CWD"; do
+    for _prefix in "$HOME/.mozbuild" "${RW_ROOTS[@]}"; do
         if [[ "$_mbpath" == "$(realpath -m "$_prefix")"* ]]; then
             _mapped=true
             break
@@ -234,7 +382,7 @@ if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     done
     if [[ "$_mapped" == false ]]; then
         echo "error: destination of MOZBUILD_STATE_PATH=$MOZBUILD_STATE_PATH is outside the sandbox." >&2
-        echo "It must be under one of: ~/.mozbuild, $RW_ROOT, or $CWD" >&2
+        echo "It must be under one of: ~/.mozbuild, ${RW_ROOTS[*]}" >&2
         exit 1
     fi
     args+=(--setenv MOZBUILD_STATE_PATH "$MOZBUILD_STATE_PATH")
