@@ -95,6 +95,107 @@ expect "deny pbcopy (clipboard)"     deny run_sb /bin/sh -c "echo test | /usr/bi
 rm -f "$HOME/.ccode-test-bad-DELETE-ME" "$HOME/.claude/.ccode-test-bad-DELETE-ME" 2>/dev/null
 
 echo
+echo "==== rw resolution: env, config, precedence ===="
+# These tests probe the SRC / CWD_ONLY resolution logic in ccode-macos by
+# inspecting which (subpath …) rules end up in the emitted sandbox profile.
+TEST_RW2="$TMP/rw-second"; mkdir -p "$TEST_RW2"
+TEST_RW3="$TMP/rw-third";  mkdir -p "$TEST_RW3"
+CFG_DIR="$TMP/cfg-dir";    mkdir -p "$CFG_DIR"
+
+expect_subpath() {
+    local desc="$1" profile="$2" path="$3"
+    if grep -qF "(subpath \"$path\")" <<<"$profile"; then
+        ok "$desc"
+    else
+        fail "$desc" "missing (subpath \"$path\")"
+    fi
+}
+expect_no_subpath() {
+    local desc="$1" profile="$2" path="$3"
+    if grep -qF "(subpath \"$path\")" <<<"$profile"; then
+        fail "$desc" "unexpected (subpath \"$path\")"
+    else
+        ok "$desc"
+    fi
+}
+write_cfg() { printf '%s\n' "$@" > "$CFG_DIR/ccode"; }
+
+# Empty config — keeps the file's mere presence from changing behaviour.
+: > "$CFG_DIR/ccode"
+
+# env CCODE_SRC: single path becomes a subpath rule.
+prof=$(CCODE_SRC="$TEST_RW" "$SCRIPT" --print-profile 2>/dev/null)
+expect_subpath "CCODE_SRC=path -> subpath rule"             "$prof" "$TEST_RW"
+
+# env CCODE_SRC: ':' separator exposes multiple trees.
+prof=$(CCODE_SRC="$TEST_RW:$TEST_RW2" "$SCRIPT" --print-profile 2>/dev/null)
+expect_subpath "CCODE_SRC=a:b -> first tree as subpath"     "$prof" "$TEST_RW"
+expect_subpath "CCODE_SRC=a:b -> second tree as subpath"    "$prof" "$TEST_RW2"
+
+# env CCODE_CWD_ONLY=1 short-circuits SRC.
+prof=$(CCODE_SRC="$TEST_RW" CCODE_CWD_ONLY=1 "$SCRIPT" --print-profile 2>/dev/null)
+expect_no_subpath "CCODE_CWD_ONLY=1 drops CCODE_SRC trees"  "$prof" "$TEST_RW"
+
+# Non-existent rw path is skipped with a warning; siblings survive.
+out=$(CCODE_SRC="$TEST_RW:/this/does/not/exist" "$SCRIPT" --print-profile 2>&1)
+expect_subpath "missing rw path skipped, sibling survives"  "$out"  "$TEST_RW"
+if grep -q '^ccode: warning.*does not exist.*does/not/exist' <<<"$out"; then
+    ok "missing rw path emits a warning"
+else
+    fail "missing rw path emits a warning" "no warning matched"
+fi
+
+# config file: global SRC used when no [section] matches.
+write_cfg "SRC = $TEST_RW" "SRC = $TEST_RW2"
+prof=$(XDG_CONFIG_HOME="$CFG_DIR" "$SCRIPT" --print-profile 2>/dev/null)
+expect_subpath "config global SRC #1 -> subpath"            "$prof" "$TEST_RW"
+expect_subpath "config global SRC #2 -> subpath"            "$prof" "$TEST_RW2"
+
+# config file: matching [section] overrides global SRC.
+write_cfg "SRC = $TEST_RW" "[$REPO]" "SRC = $TEST_RW2" "SRC = $TEST_RW3"
+prof=$(XDG_CONFIG_HOME="$CFG_DIR" "$SCRIPT" --print-profile 2>/dev/null)
+expect_no_subpath "matching section drops global SRC"       "$prof" "$TEST_RW"
+expect_subpath "matching section SRC #1"                    "$prof" "$TEST_RW2"
+expect_subpath "matching section SRC #2"                    "$prof" "$TEST_RW3"
+
+# config file: CWD_ONLY=1 inside the matching section drops all SRC.
+write_cfg "SRC = $TEST_RW" "[$REPO]" "SRC = $TEST_RW2" "CWD_ONLY = 1"
+prof=$(XDG_CONFIG_HOME="$CFG_DIR" "$SCRIPT" --print-profile 2>/dev/null)
+expect_no_subpath "section CWD_ONLY=1 drops global SRC"     "$prof" "$TEST_RW"
+expect_no_subpath "section CWD_ONLY=1 drops section SRC"    "$prof" "$TEST_RW2"
+
+# config file: longest-path section wins over a shorter ancestor section.
+write_cfg \
+    "SRC = $TEST_RW" \
+    "[$REPO]"       "SRC = $TEST_RW2" \
+    "[$REPO/test]"  "SRC = $TEST_RW3"
+prof=$(cd "$REPO/test" && XDG_CONFIG_HOME="$CFG_DIR" "$SCRIPT" --print-profile 2>/dev/null)
+expect_subpath "longest-match section wins (nested)"        "$prof" "$TEST_RW3"
+expect_no_subpath "longest-match: ancestor section dropped" "$prof" "$TEST_RW2"
+
+# precedence: env CCODE_SRC overrides config (any section).
+write_cfg "SRC = $TEST_RW2"
+prof=$(XDG_CONFIG_HOME="$CFG_DIR" CCODE_SRC="$TEST_RW" "$SCRIPT" --print-profile 2>/dev/null)
+expect_subpath "env CCODE_SRC beats config SRC"             "$prof" "$TEST_RW"
+expect_no_subpath "env CCODE_SRC drops config SRC"          "$prof" "$TEST_RW2"
+
+# precedence: env CCODE_SRC implies CWD_ONLY=0, overriding config's CWD_ONLY=1.
+write_cfg "CWD_ONLY = 1" "SRC = $TEST_RW2"
+prof=$(XDG_CONFIG_HOME="$CFG_DIR" CCODE_SRC="$TEST_RW" "$SCRIPT" --print-profile 2>/dev/null)
+expect_subpath "explicit CCODE_SRC neutralises config CWD_ONLY" "$prof" "$TEST_RW"
+
+# precedence: explicit env CCODE_CWD_ONLY=1 beats env CCODE_SRC.
+prof=$(CCODE_SRC="$TEST_RW" CCODE_CWD_ONLY=1 "$SCRIPT" --print-profile 2>/dev/null)
+expect_no_subpath "env CCODE_CWD_ONLY beats env CCODE_SRC"  "$prof" "$TEST_RW"
+
+# cwd is always rw regardless of resolution.
+prof=$(CCODE_CWD_ONLY=1 "$SCRIPT" --print-profile 2>/dev/null)
+expect_subpath "cwd is always rw (CWD_ONLY mode)"           "$prof" "$REPO"
+
+# Reset the test config so the existing later tests are unaffected.
+rm -f "$CFG_DIR/ccode"
+
+echo
 echo "==== script: env handling (env -i + redirects) ===="
 mkdir -p "$TMP/stub-bin"
 cat > "$TMP/stub-bin/claude" <<'STUB'
