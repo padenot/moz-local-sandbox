@@ -1,6 +1,7 @@
 # moz-local-sandbox
 
-Sandbox for running Claude Code (`claude`) against a Firefox checkout.
+Sandbox for running Claude Code (`claude`) or Codex (`codex`) against a
+Firefox checkout.
 
 - **Linux:** `bwrap`-based, supports `rr` via rr-mcp. Script: `ccode`.
 - **macOS:** `sandbox-exec` (Seatbelt) based. Script: `ccode-macos`.
@@ -16,40 +17,51 @@ Otherwise, check the section `Env vars` below to change the default policy.
 ### Then
 
 ```
-ccode [claude-args...]
-ccode --exec PROGRAM [args...]
+mozsb claude [claude-args...]
+mozsb codex [codex-args...]
+mozsb exec PROGRAM [args...]
 ```
 
-Without `--exec`, launches `claude --permission-mode bypassPermissions` in the
-sandbox. With `--exec`, runs the given program instead (shell, `mach`, etc).
-This can be useful to diagnosis.
+The agent subcommands disable that agent's own sandbox and approval layer,
+because the outer `mozsb` sandbox is the enforcement boundary. `exec` runs an
+arbitrary program with neither agent's state exposed (useful for diagnosis).
 
-`~/src` and state dirs are writable; most of the system is read-only. Network
-is shared (needed for various things under and in `mach`). MCP config
-(`~/.config/claude/mcp-servers.json` or `~/.claude/mcp-servers.json`) is passed
-through automatically if present.
+`~/src` and the selected agent's state directory are writable; most of the
+system is read-only. Claude state is not exposed to Codex, Codex state is not
+exposed to Claude, and neither is exposed to `exec`. Network is shared (needed
+for various things under and in `mach`). Claude MCP config is passed through
+automatically if present; Codex reads its normal `$CODEX_HOME/config.toml`.
 
-`./install.sh` symlinks the OS-appropriate script to `~/bin/ccode`, or symlink
-`ccode`/`ccode-macos` onto your `$PATH` manually.
+`./install.sh` copies the launchers and helpers into `~/.local/lib/mozsb.*`
+and symlinks the OS-appropriate installed copy as `mozsb`. Re-run it after
+updates. The launcher refuses to run when its own directory is inside the
+writable source root: sandbox-controlled files must not execute on the host.
+
+Run from within `MOZSB_SRC`, or explicitly select `MOZSB_CWD_ONLY=1` for a
+checkout elsewhere. The home directory and its ancestors cannot be selected.
 
 ### Env vars
 
-- `CCODE_SRC=/path` - use a different root than `~/src`.
-- `CCODE_CWD_ONLY=1` - expose only `$PWD` rw instead of all of `~/src`.
-- `CCODE_EXTRA_BIN_DIR=/path` - mount a host bin dir read-only, prepended to `PATH`.
-- `CCODE_NOEXEC=1` (macOS) - strip the exec bit from any file that gained it
-  during the session, on exit. No automatic restore (`chmod +x` on host).
-- `CCODE_NO_SSH_AGENT=1` - disable SSH agent forwarding.
+- `MOZSB_SRC=/path` - use a different root than `~/src`.
+- `MOZSB_CWD_ONLY=1` - expose only `$PWD` rw instead of all of `~/src`.
+- `MOZSB_EXTRA_BIN_DIR=/path` - mount a host bin dir read-only, prepended to `PATH`.
+- `MOZSB_NOEXEC=1` (macOS) - strip the exec bit from any file that gained it
+  during the session, on exit. Existing execute bits are preserved. This is
+  an exit-time convenience, not an execution barrier; scripts can still be
+  interpreted and files can execute before cleanup runs.
+- `MOZSB_NO_SSH_AGENT=1` - disable SSH agent forwarding.
+- `MOZSB_CLAUDE_BIN=/path`, `MOZSB_CODEX_BIN=/path` - override agent discovery.
+
+The former `CCODE_*` environment variable names remain accepted as aliases.
 
 ### Opening URLs in the host browser
 
 `xdg-open`/`open` are shadowed inside the sandbox and forward the URL to
 `bin/ccode-open-server`, running outside the sandbox, which re-validates and
 opens it for real. Allowed: `bugzilla.mozilla.org`, `phabricator.services.mozilla.com`,
-`localhost`/`127.0.0.1` (any port). On Linux this is a hard boundary (no other
-way to reach the OS open mechanism). On macOS it's not — LaunchServices is
-reachable directly (see Residual risks) — so treat it as a guardrail there,
-not a security boundary.
+`localhost`/`127.0.0.1` (any port). The server validates requests independently
+of the client. This does not guarantee desktop isolation: Linux shares the
+host network namespace, and macOS exposes LaunchServices (see Residual risks).
 
 ## Host setup
 
@@ -71,32 +83,41 @@ not a security boundary.
    ```
    Required for `rr`; Ubuntu's default paranoia level blocks it.
 
-3. **Disable per-repo git hooks on the host (recommended):** the sandbox can
+3. **Treat sandbox-touched repositories as untrusted on the host:** the sandbox can
    write `.git/hooks/` or `core.hooksPath`/`core.fsmonitor` in any repo under
    `~/src`, which the host's git would later execute as you.
    ```
-   git config --global core.hooksPath ~/.git-hooks-trusted
-   mkdir -p ~/.git-hooks-trusted
+   git -c core.hooksPath=/dev/null -c core.fsmonitor=false status
    ```
+   Apply these command-line overrides to each host Git invocation that needs
+   them. A global `core.hooksPath` setting is insufficient: repository-local
+   configuration overrides it. These two overrides do not neutralize other
+   execution-bearing settings such as filters, credential helpers or aliases.
 
 ### macOS
 
-No host changes needed (`sandbox-exec` ships in the base system). Disabling
-per-repo git hooks (above) is still worth doing. Verify the sandbox policy:
+No host changes needed (`sandbox-exec` ships in the base system). The host Git
+precautions above also apply. Verify the sandbox policy with isolated fixtures:
 
 ```
-./test/test-macos.sh
+make test
 ```
 
 ## What's exposed
 
 Roughly: system binaries/libs read-only; VCS credentials (`gh`, `jj`, `.gitconfig`,
 `.arcrc`, `.moz-phab-config`) read-only except moz-phab config; `~/src` (or
-`$CCODE_SRC`/`$PWD`) read-write; Claude state (`~/.claude*`) read-write; language
-toolchain caches redirected into `~/.sandbox/`; `rr` traces and `~/.mozbuild`
-read-write on Linux. macOS additionally exposes `~/Library/Keychains` read-write
-(Claude Code's credential store there) and denies a short list of user-facing
-Mach services (Dock, Notification Center, pasteboard-adjacent, AppleEvents).
+`$MOZSB_SRC`/`$PWD`) read-write; the selected agent's state (`~/.claude*` or
+`$CODEX_HOME`) read-write; language toolchain caches redirected into
+`~/.sandbox/`; `~/.profiler-cli` read-write; `rr` traces and `~/.mozbuild`
+read-write on Linux. In Claude
+mode, macOS additionally exposes `~/Library/Keychains` read-write (Claude
+Code's credential store there). Codex and `exec` modes do not expose it.
+macOS denies a short list of user-facing Mach services (Dock, Notification
+Center, pasteboard-adjacent, AppleEvents).
+Firefox's host profile contents are not exposed. On macOS its registry files
+are read-only and its crash-report directory is writable; pass an explicit
+`-profile` directory under the writable source root or `~/.sandbox`.
 See `ccode`/`ccode-macos` source for the exact mount/rule list.
 
 `~/.nvm` is read-only, like `~/.rustup`: the version you had active on the
@@ -111,15 +132,23 @@ Everything else is dropped.
 
 The sandbox reduces blast radius, it doesn't eliminate it:
 
-- **Per-repo `.git/config`** in `~/src` can plant hooks/aliases the host's git
-  will run later. Mitigate with `core.hooksPath` above; treat sandbox-touched
-  repos as untrusted on the host.
+- **Per-repo `.git/config`** in `~/src` can plant commands the host's Git
+  will run later. The command-line overrides above cover hooks and fsmonitor
+  only; treat sandbox-touched repos as untrusted on the host.
+- **Linux shares the host network namespace**, including abstract Unix
+  sockets. Depending on desktop authentication, X11/Xwayland may be reachable
+  without mounting its filesystem socket. Loopback services are also reachable
+  on both platforms. Filesystem isolation does not protect these services.
 - **Bearer tokens (gh/arc/moz-phab) are readable**, not just unmodifiable — a
   compromised agent could exfiltrate them over the network.
 - **`~/.claude`/`~/.claude.json` are shared with host claude**, read-write —
   a compromised sandbox can alter memory/settings/hooks/MCP config used by
   the host's `claude` later. (Isolating via `CLAUDE_CONFIG_DIR` was tried and
   reverted — it broke macOS login.)
+- **`$CODEX_HOME` is shared with host Codex in Codex mode**, read-write — a
+  compromised sandbox can alter settings, sessions, skills, plugins, or MCP
+  configuration used by host Codex later. It is not exposed in Claude or
+  `exec` mode.
 - **macOS has no PID isolation** — the agent can enumerate host processes
   (not signal them).
 - **macOS: `sandbox-exec` is deprecated** by Apple; still kernel-enforced

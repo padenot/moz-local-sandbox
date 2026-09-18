@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# ccode-macos — launch claude inside a sandbox-exec (Seatbelt) container.
+# mozsb (macOS) — launch a coding agent inside a sandbox-exec container.
 #
 # sandbox-exec applies a kernel-enforced sandbox profile (Apple's TinyScheme-
 # based SBPL) to a command. Filesystem access, mach lookups, signals, and
@@ -27,18 +27,69 @@ while [[ -L "$_self" ]]; do
     else _self="$(cd "$(dirname "$_self")" && pwd)/$_link"
     fi
 done
-REPO_DIR="$(cd "$(dirname "$_self")" && pwd)"
+REPO_DIR="$(cd "$(dirname "$_self")" && pwd -P)"
 
-# Source tree exposed read-write to the sandbox. Override with CCODE_SRC if
-# your checkouts live elsewhere. Set CCODE_CWD_ONLY=1 to expose only the
+usage() {
+    echo "usage: mozsb {claude|codex|exec} [args...]" >&2
+    echo "       mozsb --print-profile {claude|codex|exec}" >&2
+    exit 2
+}
+
+PRINT_PROFILE=0
+if [[ "${1:-}" == "--print-profile" ]]; then
+    PRINT_PROFILE=1
+    shift
+fi
+MODE="${1:-}"
+case "$MODE" in
+    claude|codex|exec) shift ;;
+    *) usage ;;
+esac
+[[ "$MODE" != "exec" || $# -gt 0 ]] || usage
+
+AGENT_BIN=""
+if [[ "$MODE" != "exec" ]]; then
+    if [[ "$MODE" == "codex" && -n "${MOZSB_CODEX_BIN:-}" ]]; then
+        AGENT_BIN="$MOZSB_CODEX_BIN"
+    elif [[ "$MODE" == "claude" && -n "${MOZSB_CLAUDE_BIN:-}" ]]; then
+        AGENT_BIN="$MOZSB_CLAUDE_BIN"
+    elif [[ "$MODE" == "codex" && -x /opt/homebrew/bin/codex ]]; then
+        # Prefer the native Homebrew build on macOS. It avoids exposing a Node
+        # runtime and stale npm aliases merely because they occur earlier in
+        # the host's interactive PATH.
+        AGENT_BIN=/opt/homebrew/bin/codex
+    else
+        AGENT_BIN="$(command -v "$MODE" 2>/dev/null || true)"
+    fi
+    [[ -n "$AGENT_BIN" ]] || { echo "mozsb: $MODE is not installed or not on PATH" >&2; exit 1; }
+    [[ -x "$AGENT_BIN" ]] || { echo "mozsb: $MODE executable is not executable: $AGENT_BIN" >&2; exit 1; }
+fi
+
+# Source tree exposed read-write to the sandbox. Override with MOZSB_SRC if
+# your checkouts live elsewhere. Set MOZSB_CWD_ONLY=1 to expose only the
 # current working directory instead of the whole tree — tighter blast radius
 # at the cost of cross-repo work.
-SRC="${CCODE_SRC:-$HOME/src}"
-CWD="$(pwd)"
-if [[ "${CCODE_CWD_ONLY:-0}" == "1" ]]; then
+SRC="${MOZSB_SRC:-${CCODE_SRC:-$HOME/src}}"
+SRC="$(realpath "$SRC")"
+CWD="$(pwd -P)"
+if [[ "${MOZSB_CWD_ONLY:-${CCODE_CWD_ONLY:-0}}" == "1" ]]; then
     RW_ROOT="$CWD"
 else
     RW_ROOT="$SRC"
+fi
+
+_home_real="$(realpath "$HOME")"
+if [[ "$RW_ROOT" == / || "$_home_real" == "$RW_ROOT" || "$_home_real" == "$RW_ROOT"/* ]]; then
+    echo "mozsb: refusing to expose HOME or one of its ancestors" >&2
+    exit 1
+fi
+if [[ "$CWD" != "$RW_ROOT" && "$CWD" != "$RW_ROOT"/* ]]; then
+    echo "mozsb: cwd is outside MOZSB_SRC; choose MOZSB_SRC or MOZSB_CWD_ONLY explicitly" >&2
+    exit 1
+fi
+if [[ "$REPO_DIR" == "$RW_ROOT" || "$REPO_DIR" == "$RW_ROOT"/* ]]; then
+    echo "mozsb: launcher is inside the writable source tree; run install.sh and use the installed mozsb" >&2
+    exit 1
 fi
 
 # Sandbox-private homes for language toolchains. macOS has no bind-mount
@@ -55,6 +106,7 @@ mkdir -p \
     "$SBX/go" \
     "$SBX/tmp" \
     "$SBX/empty-hooks"
+mkdir -p "$HOME/.profiler-cli"
 
 # ~/.claude is shared rw with the host (re-exposed below). We had it
 # isolated via CLAUDE_CONFIG_DIR at one point, but Claude Code on macOS
@@ -69,19 +121,31 @@ mkdir -p \
 # allowlist, and calls /usr/bin/open on the host. The in-sandbox `open`
 # command (bin/open, earlier on PATH than /usr/bin/open) sends requests
 # here via loopback.
+RUNTIME_DIR="$(mktemp -d "$_home_real/.mozsb-run.XXXXXXXX")"
+NOEXEC_SNAPSHOT=""
+cleanup() {
+    [[ -z "${OPEN_SERVER_PID:-}" ]] || kill "$OPEN_SERVER_PID" 2>/dev/null || true
+    if [[ -n "$NOEXEC_SNAPSHOT" && -f "$NOEXEC_SNAPSHOT" ]]; then
+        python3 -I "$REPO_DIR/bin/ccode-noexec" restore "$RW_ROOT" "$NOEXEC_SNAPSHOT"
+    fi
+    rm -f "$RUNTIME_DIR/open-server-status" "$RUNTIME_DIR/open-server.log" "$RUNTIME_DIR/noexec.json"
+    rmdir "$RUNTIME_DIR"
+}
+trap cleanup EXIT
 OPEN_PORT=""
 OPEN_SERVER_PID=""
 _OPEN_SERVER="$REPO_DIR/bin/ccode-open-server"
 
-if [[ "${1:-}" != "--print-profile" ]] && [[ -f "$_OPEN_SERVER" ]]; then
-    _OPEN_STATUS="$SBX/open-server-status-$$"
-    _OPEN_LOG="$SBX/open-server.log"
-    python3 "$_OPEN_SERVER" > "$_OPEN_STATUS" 2>"$_OPEN_LOG" &
+if [[ "$PRINT_PROFILE" == "0" ]] && [[ -f "$_OPEN_SERVER" ]]; then
+    _OPEN_STATUS="$RUNTIME_DIR/open-server-status"
+    _OPEN_LOG="$RUNTIME_DIR/open-server.log"
+    python3 -I "$_OPEN_SERVER" > "$_OPEN_STATUS" 2>"$_OPEN_LOG" &
     OPEN_SERVER_PID=$!
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         if [[ -s "$_OPEN_STATUS" ]]; then break; fi
         if ! kill -0 "$OPEN_SERVER_PID" 2>/dev/null; then
-            echo "ccode: open server failed to start (see $_OPEN_LOG)" >&2
+            echo "mozsb: open server failed to start" >&2
+            cat "$_OPEN_LOG" >&2
             break
         fi
         sleep 0.2
@@ -91,13 +155,14 @@ if [[ "${1:-}" != "--print-profile" ]] && [[ -f "$_OPEN_SERVER" ]]; then
     rm -f "$_OPEN_STATUS"
     if [[ "$_line" =~ OPEN_PORT=([0-9]+) ]]; then
         OPEN_PORT="${BASH_REMATCH[1]}"
-        echo "ccode: open server started (port=$OPEN_PORT)" >&2
+        echo "mozsb: open server started (port=$OPEN_PORT)" >&2
     fi
 fi
 
-if [[ -n "${CCODE_EXTRA_BIN_DIR:-}" ]]; then
-    CCODE_EXTRA_BIN_DIR="${CCODE_EXTRA_BIN_DIR/#\~/$HOME}"
-    [[ -d "$CCODE_EXTRA_BIN_DIR" ]] || { echo "ccode: CCODE_EXTRA_BIN_DIR=$CCODE_EXTRA_BIN_DIR: not a directory" >&2; exit 1; }
+MOZSB_EXTRA_BIN_DIR="${MOZSB_EXTRA_BIN_DIR:-${CCODE_EXTRA_BIN_DIR:-}}"
+if [[ -n "$MOZSB_EXTRA_BIN_DIR" ]]; then
+    MOZSB_EXTRA_BIN_DIR="${MOZSB_EXTRA_BIN_DIR/#\~/$HOME}"
+    [[ -d "$MOZSB_EXTRA_BIN_DIR" ]] || { echo "mozsb: MOZSB_EXTRA_BIN_DIR=$MOZSB_EXTRA_BIN_DIR: not a directory" >&2; exit 1; }
 fi
 # nvm activates a node version by mutating PATH from a shell function the
 # user's rc sources; anything the sandbox execs directly — claude included —
@@ -140,22 +205,21 @@ fi
 # line is rewritten, and only when it is stale — `npm login` inside the sandbox
 # writes its auth token to this file, and recreating it every launch would throw
 # that away.
-if [[ ! -f "$SBX/npmrc" ]]; then
-    printf 'prefix=%s\n' "$NPM_PREFIX" > "$SBX/npmrc"
-elif ! grep -qxF "prefix=$NPM_PREFIX" "$SBX/npmrc"; then
-    {
-        grep -v '^prefix[[:space:]]*=' "$SBX/npmrc" || true
-        printf 'prefix=%s\n' "$NPM_PREFIX"
-    } > "$SBX/npmrc.new"
-    mv "$SBX/npmrc.new" "$SBX/npmrc"
-fi
+python3 -I "$REPO_DIR/bin/ccode-npmrc" "$SBX" "$NPM_PREFIX"
 
 _SANDBOX_PATH="$SBX/cargo/bin:$HOME/.cargo/bin:$HOME/.local/bin:$SBX/npm-prefix/bin:${_NODE_BIN:+$_NODE_BIN:}$REPO_DIR/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
-[[ -n "${CCODE_EXTRA_BIN_DIR:-}" ]] && _SANDBOX_PATH="${CCODE_EXTRA_BIN_DIR}:${_SANDBOX_PATH}"
+[[ -n "$MOZSB_EXTRA_BIN_DIR" ]] && _SANDBOX_PATH="${MOZSB_EXTRA_BIN_DIR}:${_SANDBOX_PATH}"
 
-# Build the sandbox profile (SBPL). $HOME / $RW_ROOT / $SBX are interpolated
-# by the shell into Scheme string literals — assumes paths contain no `"' or
-# `\' (true for normal Unix paths).
+# Quote every filesystem path inserted into SBPL as a Scheme string.
+sb_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "$value"
+}
 PROFILE=$(cat <<SBPROFILE
 (version 1)
 (deny default)
@@ -247,7 +311,8 @@ PROFILE=$(cat <<SBPROFILE
 (allow file-map-executable)
 
 ;; --- Network ---
-(allow network*)
+(allow network-outbound (remote ip))
+(allow network-bind network-inbound (local ip))
 
 ;; Loopback and Unix domain sockets are always explicitly allowed (needed
 ;; for Marionette and the ccode open server on localhost).
@@ -259,8 +324,11 @@ PROFILE=$(cat <<SBPROFILE
 (allow network-outbound (remote ip "localhost:*"))
 (allow network-bind (local ip))
 (allow network-inbound (local ip "localhost:*"))
-(allow network-outbound (remote unix-socket))
-(allow network-bind network-inbound (local unix-socket))
+;; Unix sockets must belong to the sandbox's writable trees. In particular,
+;; allowing all Unix sockets would bypass MOZSB_NO_SSH_AGENT.
+(allow network-outbound network-bind network-inbound
+  (subpath $(sb_quote "$RW_ROOT"))
+  (subpath $(sb_quote "$SBX")))
 
 ;; --- Read-only system filesystems ---
 ;; Root-level entries are allowed so that path traversal into the allowed
@@ -306,18 +374,16 @@ PROFILE=$(cat <<SBPROFILE
 ;; denied" warnings when it tries to source them on startup; commands
 ;; still run normally.
 (allow file-read*
-  (literal "$HOME/.gitconfig")
-  (literal "$HOME/.arcrc")
-  (subpath "$HOME/.nvm")
-  (subpath "$HOME/.local/bin")
-  (subpath "$HOME/.local/share/claude")
-  (subpath "$HOME/.config/gh")
-  (subpath "$HOME/.config/claude")
-  (subpath "$HOME/.config/jj")
-  (subpath "$HOME/.rustup")
-  (subpath "$HOME/.cargo/bin")
-  (literal "$HOME/.ssh/known_hosts")
-  (literal "$HOME/.ssh/config"))
+  (literal $(sb_quote "$HOME/.gitconfig"))
+  (literal $(sb_quote "$HOME/.arcrc"))
+  (subpath $(sb_quote "$HOME/.nvm"))
+  (subpath $(sb_quote "$HOME/.local/bin"))
+  (subpath $(sb_quote "$HOME/.config/gh"))
+  (subpath $(sb_quote "$HOME/.config/jj"))
+  (subpath $(sb_quote "$HOME/.rustup"))
+  (subpath $(sb_quote "$HOME/.cargo/bin"))
+  (literal $(sb_quote "$HOME/.ssh/known_hosts"))
+  (literal $(sb_quote "$HOME/.ssh/config")))
 
 
 ;; ~/.ssh is intentionally NOT bound. Read access to private keys lets a
@@ -325,70 +391,91 @@ PROFILE=$(cat <<SBPROFILE
 ;; ssh-agent socket is forwarded conditionally below: the agent can sign
 ;; auth challenges via the agent but cannot read the underlying keys.
 
-;; macOS Keychain: needed RW for Claude Code on macOS. The OAuth token
-;; lives under "Claude Code" in the login keychain; claude reads it at
-;; startup and rewrites it on /login (token refresh). RO-only here makes
-;; /login fail with "Failed to save API key to macOS Keychain".
-;;
-;; The sandbox-profile RW is at the *file* level. Per-entry access in the
-;; keychain DB is still gated by securityd ACLs, so the agent cannot
-;; silently dump unrelated entries (Slack, 1Password, etc.) — those ACLs
-;; pop a consent prompt or deny. Reading and writing the Claude Code
-;; entry is what works after the user clicks Always Allow once.
-;;
-;; CLAUDE_CODE_OAUTH_TOKEN is still forwarded via env (see launcher) as a
-;; fallback for first-launch / fresh machines where claude has not yet
-;; been granted keychain access.
-(allow file-read* file-write*
-  (subpath "$HOME/Library/Keychains")
-  (subpath "/Library/Keychains")
-  (subpath "/private/var/db/SystemKey")
-  (subpath "/private/var/db/mds"))
-
 ;; ~/Library/Caches — scoped to lldb/debugger paths so the sandbox can
 ;; read and write symbol caches during a debug session.  True isolation
 ;; (redirecting writes to \$SBX) is not possible on macOS without bind
 ;; mounts; this is the narrowest grant that covers known lldb needs.
 ;; ~/Library/Developer is needed for debugserver and device support symbols.
 (allow file-read* file-write*
-  (subpath "$HOME/Library/Caches/com.apple.dt.lldb")
-  (subpath "$HOME/Library/Caches/com.apple.symbols")
-  (subpath "$HOME/Library/Developer"))
+  (subpath $(sb_quote "$HOME/Library/Caches/com.apple.dt.lldb"))
+  (subpath $(sb_quote "$HOME/Library/Caches/com.apple.symbols"))
+  (subpath $(sb_quote "$HOME/Library/Developer")))
 
-;; ~/Library/Application Support/Firefox holds profiles.ini and the crash
-;; reports directory. Even with an explicit -profile path, the Firefox
-;; profile service reads/writes this on startup; without it, profile
-;; selection fails and Firefox shows a native profile-missing dialog
-;; that spins the event loop forever in headless/no-display test runs.
+;; Firefox needs its registry during startup, even with -profile. Keep it
+;; read-only and do not expose the user's profile contents. Use an explicit
+;; -profile directory inside the writable source tree or sandbox storage.
+(allow file-read*
+  (literal $(sb_quote "$HOME/Library/Application Support/Firefox"))
+  (literal $(sb_quote "$HOME/Library/Application Support/Firefox/profiles.ini"))
+  (literal $(sb_quote "$HOME/Library/Application Support/Firefox/installs.ini")))
 (allow file-read* file-write*
-  (subpath "$HOME/Library/Application Support/Firefox"))
+  (subpath $(sb_quote "$HOME/Library/Application Support/Firefox/Crash Reports")))
 
 ;; --- Read-write paths ---
-;; ~/.claude and ~/.claude.json are rw-shared with host. A compromised
-;; sandbox can edit settings, hooks, skills or MCP entries that the host
 (allow file-read* file-write*
-  (literal "$HOME/.moz-phab-config")
-  (subpath "$RW_ROOT")
-  (subpath "$CWD")
-  (subpath "$HOME/.claude")
-  (literal "$HOME/.claude.json")
-  (subpath "$HOME/.mozbuild")
-  (subpath "$SBX"))
+  (literal $(sb_quote "$HOME/.moz-phab-config"))
+  (subpath $(sb_quote "$HOME/.profiler-cli"))
+  (subpath $(sb_quote "$RW_ROOT"))
+  (subpath $(sb_quote "$HOME/.mozbuild"))
+  (subpath $(sb_quote "$SBX")))
+
+;; Host-side launcher code and session files must never be sandbox-writable.
+(allow file-read* (subpath $(sb_quote "$REPO_DIR")))
+(deny file-write* (subpath $(sb_quote "$REPO_DIR")))
+(deny file-read* file-write* (subpath $(sb_quote "$RUNTIME_DIR")))
+
 SBPROFILE
 )
 
-if [[ -z "${CCODE_NO_SSH_AGENT:-}" ]]; then
+# Add only the selected agent's executable and state. In particular, Codex
+# does not get Claude's state or the macOS keychain, and Claude does not get
+# CODEX_HOME. Optional shared ~/.agents skills are deliberately not exposed.
+if [[ "$MODE" == "claude" ]]; then
+    PROFILE+=$'\n'"(allow file-read* (subpath $(sb_quote "$HOME/.local/share/claude")) (subpath $(sb_quote "$HOME/.config/claude")))"
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$HOME/.claude")) (literal $(sb_quote "$HOME/.claude.json")))"
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$HOME/Library/Keychains")) (subpath \"/Library/Keychains\") (subpath \"/private/var/db/SystemKey\") (subpath \"/private/var/db/mds\"))"
+elif [[ "$MODE" == "codex" ]]; then
+    CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+    CODEX_HOME="${CODEX_HOME/#\~/$HOME}"
+    mkdir -p "$CODEX_HOME"
+    CODEX_HOME="$(realpath "$CODEX_HOME")"
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$CODEX_HOME")))"
+fi
+
+# npm/fnm installs use a JavaScript shim plus a native package next to it.
+# Grant the selected agent's package namespace and node binary directory only;
+# native/Homebrew installs are already covered by the system /opt rule.
+if [[ -n "$AGENT_BIN" ]]; then
+    _agent_real="$(realpath "$AGENT_BIN")"
+    PROFILE+=$'\n'"(allow file-read* (literal $(sb_quote "$AGENT_BIN")) (literal $(sb_quote "$_agent_real")))"
+    if [[ "$_agent_real" == *"/lib/node_modules/"* ]]; then
+        _node_modules_prefix="${_agent_real%%/lib/node_modules/*}/lib/node_modules"
+        _agent_scope="${_agent_real#"$_node_modules_prefix"/}"
+        _agent_scope="${_agent_scope%%/*}"
+        PROFILE+=$'\n'"(allow file-read* (subpath $(sb_quote "$_node_modules_prefix/$_agent_scope")))"
+        _agent_node="$(command -v node 2>/dev/null || true)"
+        if [[ -n "$_agent_node" ]]; then
+            _agent_node_real="$(realpath "$_agent_node")"
+            PROFILE+=$'\n'"(allow file-read* (literal $(sb_quote "$_agent_node")) (literal $(sb_quote "$_agent_node_real")) (subpath $(sb_quote "$(dirname "$_agent_node_real")")))"
+            _SANDBOX_PATH="$(dirname "$_agent_node"):${_SANDBOX_PATH}"
+        fi
+    fi
+fi
+
+if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
   # Conditionally allow the ssh-agent socket. On macOS, SSH_AUTH_SOCK is
   # typically /var/run/com.apple.launchd.*/Listeners, which is a symlink into
   # /private/var/run/... — the sandbox literal rule must use the canonical path
   # because the kernel checks resolved paths, not symlinks.
-  if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
-      _ssh_sock_real="$(realpath "$SSH_AUTH_SOCK" 2>/dev/null || echo "$SSH_AUTH_SOCK")"
-      PROFILE+=$'\n'"(allow file-read* file-write* network-outbound (literal \"$_ssh_sock_real\"))"
+  _ssh_sock_real="$(realpath "$SSH_AUTH_SOCK")"
+  if [[ -z "${MOZSB_NO_SSH_AGENT:-${CCODE_NO_SSH_AGENT:-}}" ]]; then
+      PROFILE+=$'\n'"(allow file-read* file-write* network-outbound (literal $(sb_quote "$_ssh_sock_real")))"
+  else
+      PROFILE+=$'\n'"(deny network-outbound (literal $(sb_quote "$_ssh_sock_real")))"
   fi
-  if [[ -n "${CCODE_EXTRA_BIN_DIR:-}" ]]; then
-      PROFILE+=$'\n'"(allow file-read* (subpath \"$CCODE_EXTRA_BIN_DIR\"))"
-  fi
+fi
+if [[ -n "$MOZSB_EXTRA_BIN_DIR" ]]; then
+    PROFILE+=$'\n'"(allow file-read* (subpath $(sb_quote "$MOZSB_EXTRA_BIN_DIR")))"
 fi
 
 
@@ -455,6 +542,7 @@ ENV_ARGS=(
     MOZ_DISABLE_SOCKET_PROCESS_SANDBOX="1"
     MOZ_DISABLE_UTILITY_SANDBOX="1"
 )
+[[ "$MODE" == "codex" ]] && ENV_ARGS+=(CODEX_HOME="$CODEX_HOME")
 
 # Note: we used to forward Claude Code's OAuth token via
 # CLAUDE_CODE_OAUTH_TOKEN, extracted from the host keychain with
@@ -483,17 +571,20 @@ fi
 # write build artefacts into it.
 if [[ -n "${MOZCONFIG:-}" ]]; then
     ENV_ARGS+=(MOZCONFIG="$MOZCONFIG")
-    PROFILE+=$'\n'"(allow file-read* file-write* (subpath \"$MOZCONFIG\"))"
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$MOZCONFIG")))"
 fi
 # MOZBUILD_STATE_PATH overrides the default ~/.mozbuild for mach build state.
 # Validate that it's inside an already-writable path before granting a new
 # profile subpath rule; an arbitrary host path would otherwise escape the
 # sandbox policy with rw access.
 if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
-    _mbpath="$(realpath -m "$MOZBUILD_STATE_PATH")"
+    # Python's realpath handles missing final components on macOS as well.
+    canonical_path() { python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+    _mbpath="$(canonical_path "$MOZBUILD_STATE_PATH")"
     _mapped=false
-    for _prefix in "$HOME/.mozbuild" "$RW_ROOT" "$CWD"; do
-        if [[ "$_mbpath" == "$(realpath -m "$_prefix")"* ]]; then
+    for _prefix in "$HOME/.mozbuild" "$RW_ROOT"; do
+        _prefix="$(canonical_path "$_prefix")"
+        if [[ "$_mbpath" == "$_prefix" || "$_mbpath" == "$_prefix"/* ]]; then
             _mapped=true
             break
         fi
@@ -504,78 +595,47 @@ if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
         exit 1
     fi
     ENV_ARGS+=(MOZBUILD_STATE_PATH="$MOZBUILD_STATE_PATH")
-    PROFILE+=$'\n'"(allow file-read* file-write* (subpath \"$_mbpath\"))"
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$_mbpath")))"
 fi
-if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
+if [[ -z "${MOZSB_NO_SSH_AGENT:-${CCODE_NO_SSH_AGENT:-}}" && -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
     ENV_ARGS+=(SSH_AUTH_SOCK="$SSH_AUTH_SOCK")
 fi
 [[ -n "$OPEN_PORT" ]] && ENV_ARGS+=(CCODE_OPEN_PORT="$OPEN_PORT")
 
 # Debug helper: print the assembled profile and exit. Used by the test suite
 # and useful for inspecting what the sandbox actually allows on this host.
-if [[ "${1:-}" == "--print-profile" ]]; then
+if [[ "$PRINT_PROFILE" == "1" ]]; then
     printf '%s\n' "$PROFILE"
     exit 0
 fi
 
-# Opt-in host-side noexec: with CCODE_NOEXEC=1, any file under $RW_ROOT
-# that gains +x (or is created with +x) during the sandbox session has
-# the execute bit stripped on exit. This is the macOS equivalent of the
-# Linux `bwrap`-on-host-with-MS_NOEXEC trick — we can't bind-mount on
-# macOS, so we detect-and-strip instead of mount-with-noexec. Files that
-# already had +x before launch are left alone (mtime-based diff).
-NOEXEC_MARKER=""
-if [[ "${CCODE_NOEXEC:-0}" == "1" ]]; then
-    NOEXEC_MARKER="$SBX/noexec-marker-$$"
-    : > "$NOEXEC_MARKER"
+# Snapshot execute permissions in host-only storage. chmod changes ctime,
+# not mtime; a timestamp marker cannot detect files that gain execute bits.
+if [[ "${MOZSB_NOEXEC:-${CCODE_NOEXEC:-0}}" == "1" ]]; then
+    NOEXEC_SNAPSHOT="$RUNTIME_DIR/noexec.json"
+    python3 -I "$REPO_DIR/bin/ccode-noexec" snapshot "$RW_ROOT" "$NOEXEC_SNAPSHOT"
 fi
 
-cleanup() {
-    if [[ -n "$OPEN_SERVER_PID" ]] && kill -0 "$OPEN_SERVER_PID" 2>/dev/null; then
-        kill "$OPEN_SERVER_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$NOEXEC_MARKER" && -f "$NOEXEC_MARKER" ]]; then
-        # find: files newer than the marker that currently have any x bit set,
-        # then chmod a-x. -perm +ugo+x matches if ANY x bit is set. The `+`
-        # batches into single chmod invocations for speed.
-        local count
-        count=$(/usr/bin/find "$RW_ROOT" -type f -newer "$NOEXEC_MARKER" \
-                    -perm +ugo+x 2>/dev/null | /usr/bin/wc -l | /usr/bin/tr -d ' ')
-        if [[ "$count" -gt 0 ]]; then
-            echo "ccode: noexec — stripping +x from $count file(s) modified during session" >&2
-            /usr/bin/find "$RW_ROOT" -type f -newer "$NOEXEC_MARKER" \
-                -perm +ugo+x -exec /bin/chmod a-x {} + 2>/dev/null
-        fi
-        rm -f "$NOEXEC_MARKER"
-    fi
-}
-trap cleanup EXIT
-
-# bypassPermissions: filesystem restrictions above replace claude's per-tool
-# permission prompts. --mcp-config is added if the user has one.
-# Claude Code stores mcp-servers.json in either ~/.config/claude/ or ~/.claude/
-# depending on version/platform; check both and use the first match.
-CLAUDE_ARGS=(--permission-mode bypassPermissions)
-MCP_CONFIG=""
-for _candidate in "$HOME/.config/claude/mcp-servers.json" "$HOME/.claude/mcp-servers.json"; do
-    if [[ -f "$_candidate" ]]; then
-        MCP_CONFIG="$_candidate"
-        break
-    fi
-done
-[[ -n "$MCP_CONFIG" ]] && CLAUDE_ARGS+=(--mcp-config "$MCP_CONFIG")
-
-# Run without `exec` so the EXIT trap (noexec_strip) fires after the
+# Run without `exec` so the EXIT trap fires after the
 # sandbox exits. Bash sits between the controlling TTY and the sandboxed
 # process; signal forwarding for foreground process groups (Ctrl+C in the
 # TUI) still works normally.
-if [[ "${1:-}" == "--exec" ]]; then
-    shift
-    env -i "${ENV_ARGS[@]}" sandbox-exec -p "$PROFILE" "$@"
-else
-    env -i "${ENV_ARGS[@]}" \
-        sandbox-exec -p "$PROFILE" \
-        "$(command -v claude)" \
-        "${CLAUDE_ARGS[@]}" \
-        "$@"
-fi
+case "$MODE" in
+    exec)
+        env -i "${ENV_ARGS[@]}" sandbox-exec -p "$PROFILE" "$@"
+        ;;
+    claude)
+        CLAUDE_ARGS=(--permission-mode bypassPermissions)
+        MCP_CONFIG=""
+        for _candidate in "$HOME/.config/claude/mcp-servers.json" "$HOME/.claude/mcp-servers.json"; do
+            if [[ -f "$_candidate" ]]; then MCP_CONFIG="$_candidate"; break; fi
+        done
+        [[ -n "$MCP_CONFIG" ]] && CLAUDE_ARGS+=(--mcp-config "$MCP_CONFIG")
+        env -i "${ENV_ARGS[@]}" sandbox-exec -p "$PROFILE" \
+            "$_agent_real" "${CLAUDE_ARGS[@]}" "$@"
+        ;;
+    codex)
+        env -i "${ENV_ARGS[@]}" sandbox-exec -p "$PROFILE" \
+            "$_agent_real" --dangerously-bypass-approvals-and-sandbox "$@"
+        ;;
+esac

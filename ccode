@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# ccode — launch claude inside a bwrap sandbox.
+# mozsb (Linux) — launch a coding agent inside a bwrap sandbox.
 #
 # bwrap (bubblewrap) creates a lightweight container using unprivileged Linux
 # user namespaces: bind mounts and FS isolation without root. The whole script
@@ -22,18 +22,59 @@ while [[ -L "$_self" ]]; do
     else _self="$(cd "$(dirname "$_self")" && pwd)/$_link"
     fi
 done
-REPO_DIR="$(cd "$(dirname "$_self")" && pwd)"
+REPO_DIR="$(cd "$(dirname "$_self")" && pwd -P)"
 
-# Source tree exposed read-write to the sandbox. Override with CCODE_SRC if
-# your checkouts live elsewhere. Set CCODE_CWD_ONLY=1 to expose only the
+usage() {
+    echo "usage: mozsb {claude|codex|exec} [args...]" >&2
+    exit 2
+}
+
+MODE="${1:-}"
+case "$MODE" in
+    claude|codex|exec) shift ;;
+    *) usage ;;
+esac
+[[ "$MODE" != "exec" || $# -gt 0 ]] || usage
+
+AGENT_BIN=""
+if [[ "$MODE" != "exec" ]]; then
+    if [[ "$MODE" == "codex" && -n "${MOZSB_CODEX_BIN:-}" ]]; then
+        AGENT_BIN="$MOZSB_CODEX_BIN"
+    elif [[ "$MODE" == "claude" && -n "${MOZSB_CLAUDE_BIN:-}" ]]; then
+        AGENT_BIN="$MOZSB_CLAUDE_BIN"
+    else
+        AGENT_BIN="$(command -v "$MODE" 2>/dev/null || true)"
+    fi
+    [[ -n "$AGENT_BIN" ]] || { echo "mozsb: $MODE is not installed or not on PATH" >&2; exit 1; }
+    [[ -x "$AGENT_BIN" ]] || { echo "mozsb: $MODE executable is not executable: $AGENT_BIN" >&2; exit 1; }
+fi
+
+# Source tree exposed read-write to the sandbox. Override with MOZSB_SRC if
+# your checkouts live elsewhere. Set MOZSB_CWD_ONLY=1 to expose only the
 # current working directory instead of the whole tree — tighter blast radius
 # at the cost of cross-repo work.
-SRC="${CCODE_SRC:-$HOME/src}"
-CWD="$(pwd)"
-if [[ "${CCODE_CWD_ONLY:-0}" == "1" ]]; then
+SRC="${MOZSB_SRC:-${CCODE_SRC:-$HOME/src}}"
+SRC="$(realpath -m "$SRC")"
+CWD="$(pwd -P)"
+if [[ "${MOZSB_CWD_ONLY:-${CCODE_CWD_ONLY:-0}}" == "1" ]]; then
     RW_ROOT="$CWD"
 else
     RW_ROOT="$SRC"
+fi
+
+# Never expand the policy just because mozsb was started in another directory.
+_home_real="$(realpath "$HOME")"
+if [[ "$RW_ROOT" == / || "$_home_real" == "$RW_ROOT" || "$_home_real" == "$RW_ROOT"/* ]]; then
+    echo "mozsb: refusing to expose HOME or one of its ancestors" >&2
+    exit 1
+fi
+if [[ "$CWD" != "$RW_ROOT" && "$CWD" != "$RW_ROOT"/* ]]; then
+    echo "mozsb: cwd is outside MOZSB_SRC; choose MOZSB_SRC or MOZSB_CWD_ONLY explicitly" >&2
+    exit 1
+fi
+if [[ "$REPO_DIR" == "$RW_ROOT" || "$REPO_DIR" == "$RW_ROOT"/* ]]; then
+    echo "mozsb: launcher is inside the writable source tree; run install.sh and use the installed mozsb" >&2
+    exit 1
 fi
 
 # Sandbox-private homes for language toolchains. The host's caches are NOT
@@ -51,6 +92,7 @@ mkdir -p \
     "$SBX/pip" \
     "$SBX/go" \
     "$SBX/empty-hooks"
+mkdir -p "$HOME/.profiler-cli"
 
 # rr's default trace directory. Bound read-write below so traces survive the
 # session; create it on the host first, since rr may never have run here.
@@ -60,17 +102,25 @@ mkdir -p "$HOME/.local/share/rr"
 # listens on a random loopback port, validates URLs against a hardcoded
 # allowlist, and calls xdg-open on the host. The in-sandbox xdg-open
 # wrapper at /opt/ccode-bin/xdg-open talks to it via loopback (--share-net).
+RUNTIME_DIR="$(mktemp -d "$_home_real/.mozsb-run.XXXXXXXX")"
+cleanup() {
+    [[ -z "${_OPEN_PID:-}" ]] || kill "$_OPEN_PID" 2>/dev/null || true
+    rm -f "$RUNTIME_DIR/open-server-status" "$RUNTIME_DIR/open-server.log"
+    rmdir "$RUNTIME_DIR"
+}
+trap cleanup EXIT
 OPEN_PORT=""
 _OPEN_SERVER="$REPO_DIR/bin/ccode-open-server"
 if [[ -f "$_OPEN_SERVER" ]]; then
-    _OPEN_STATUS="$SBX/open-server-status-$$"
-    _OPEN_LOG="$SBX/open-server.log"
-    python3 "$_OPEN_SERVER" > "$_OPEN_STATUS" 2>"$_OPEN_LOG" &
+    _OPEN_STATUS="$RUNTIME_DIR/open-server-status"
+    _OPEN_LOG="$RUNTIME_DIR/open-server.log"
+    python3 -I "$_OPEN_SERVER" > "$_OPEN_STATUS" 2>"$_OPEN_LOG" &
     _OPEN_PID=$!
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         if [[ -s "$_OPEN_STATUS" ]]; then break; fi
         if ! kill -0 "$_OPEN_PID" 2>/dev/null; then
-            echo "ccode: open server failed to start (see $_OPEN_LOG)" >&2
+            echo "mozsb: open server failed to start" >&2
+            cat "$_OPEN_LOG" >&2
             break
         fi
         sleep 0.2
@@ -80,13 +130,14 @@ if [[ -f "$_OPEN_SERVER" ]]; then
     rm -f "$_OPEN_STATUS"
     if [[ "$_line" =~ OPEN_PORT=([0-9]+) ]]; then
         OPEN_PORT="${BASH_REMATCH[1]}"
-        echo "ccode: open server started (port=$OPEN_PORT)" >&2
+        echo "mozsb: open server started (port=$OPEN_PORT)" >&2
     fi
 fi
 
-if [[ -n "${CCODE_EXTRA_BIN_DIR:-}" ]]; then
-    CCODE_EXTRA_BIN_DIR="${CCODE_EXTRA_BIN_DIR/#\~/$HOME}"
-    [[ -d "$CCODE_EXTRA_BIN_DIR" ]] || { echo "ccode: CCODE_EXTRA_BIN_DIR=$CCODE_EXTRA_BIN_DIR: not a directory" >&2; exit 1; }
+MOZSB_EXTRA_BIN_DIR="${MOZSB_EXTRA_BIN_DIR:-${CCODE_EXTRA_BIN_DIR:-}}"
+if [[ -n "$MOZSB_EXTRA_BIN_DIR" ]]; then
+    MOZSB_EXTRA_BIN_DIR="${MOZSB_EXTRA_BIN_DIR/#\~/$HOME}"
+    [[ -d "$MOZSB_EXTRA_BIN_DIR" ]] || { echo "mozsb: MOZSB_EXTRA_BIN_DIR=$MOZSB_EXTRA_BIN_DIR: not a directory" >&2; exit 1; }
 fi
 # nvm activates a node version by mutating PATH from a shell function the
 # user's rc sources; anything the sandbox execs directly — claude included —
@@ -129,18 +180,29 @@ fi
 # line is rewritten, and only when it is stale — `npm login` inside the sandbox
 # writes its auth token to this file, and recreating it every launch would throw
 # that away.
-if [[ ! -f "$SBX/npmrc" ]]; then
-    printf 'prefix=%s\n' "$NPM_PREFIX" > "$SBX/npmrc"
-elif ! grep -qxF "prefix=$NPM_PREFIX" "$SBX/npmrc"; then
-    {
-        grep -v '^prefix[[:space:]]*=' "$SBX/npmrc" || true
-        printf 'prefix=%s\n' "$NPM_PREFIX"
-    } > "$SBX/npmrc.new"
-    mv "$SBX/npmrc.new" "$SBX/npmrc"
-fi
+python3 -I "$REPO_DIR/bin/ccode-npmrc" "$SBX" "$NPM_PREFIX"
 
 _SANDBOX_PATH="$HOME/.cargo/bin:$HOME/.local/bin:$SBX/npm-prefix/bin:${_NODE_BIN:+$_NODE_BIN:}/opt/ccode-bin:/opt/cargo-host/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-[[ -n "${CCODE_EXTRA_BIN_DIR:-}" ]] && _SANDBOX_PATH="${CCODE_EXTRA_BIN_DIR}:${_SANDBOX_PATH}"
+[[ -n "$MOZSB_EXTRA_BIN_DIR" ]] && _SANDBOX_PATH="${MOZSB_EXTRA_BIN_DIR}:${_SANDBOX_PATH}"
+
+_agent_real=""
+_agent_package_root=""
+_agent_node=""
+_agent_node_real=""
+if [[ -n "$AGENT_BIN" ]]; then
+    _agent_real="$(realpath -m "$AGENT_BIN")"
+    if [[ "$_agent_real" == *"/lib/node_modules/"* ]]; then
+        _node_modules_prefix="${_agent_real%%/lib/node_modules/*}/lib/node_modules"
+        _agent_scope="${_agent_real#"$_node_modules_prefix"/}"
+        _agent_scope="${_agent_scope%%/*}"
+        _agent_package_root="$_node_modules_prefix/$_agent_scope"
+        _agent_node="$(command -v node 2>/dev/null || true)"
+        if [[ -n "$_agent_node" ]]; then
+            _agent_node_real="$(realpath -m "$_agent_node")"
+            _SANDBOX_PATH="$(dirname "$_agent_node"):${_SANDBOX_PATH}"
+        fi
+    fi
+fi
 
 # Build the bwrap argv as an array. Bash does not allow `# comment` lines
 # between `\`-continued lines, so the previous form silently broke the command
@@ -185,23 +247,12 @@ args=(
     --ro-bind "$HOME/.gitconfig"             "$HOME/.gitconfig"
     --ro-bind-try "$HOME/.nvm"               "$HOME/.nvm"
     --ro-bind "$HOME/.local/bin"             "$HOME/.local/bin"
-    --ro-bind "$HOME/.local/share/claude"    "$HOME/.local/share/claude"
     --ro-bind "$HOME/.arcrc"                 "$HOME/.arcrc"
     --ro-bind-try "$HOME/.config/gh"             "$HOME/.config/gh"
-    --ro-bind-try "$HOME/.config/claude"     "$HOME/.config/claude"  # may not exist; mcp-servers.json searched explicitly below
     --ro-bind-try "$HOME/.config/jj"         "$HOME/.config/jj"
 
-    # Shell rc/profile files: the Bash tool spawns $SHELL to run commands,
-    # which sources these on startup. Cover both bash and zsh regardless of
-    # which is $SHELL, since either may still be invoked interactively.
-    --ro-bind-try "$HOME/.bashrc"             "$HOME/.bashrc"
-    --ro-bind-try "$HOME/.bash_profile"       "$HOME/.bash_profile"
-    --ro-bind-try "$HOME/.bash_login"         "$HOME/.bash_login"
-    --ro-bind-try "$HOME/.profile"            "$HOME/.profile"
-    --ro-bind-try "$HOME/.zshrc"              "$HOME/.zshrc"
-    --ro-bind-try "$HOME/.zprofile"           "$HOME/.zprofile"
-    --ro-bind-try "$HOME/.zshenv"             "$HOME/.zshenv"
-    --ro-bind-try "$HOME/.zlogin"             "$HOME/.zlogin"
+    # Personal shell startup files can contain secrets and undo --clearenv.
+    # Do not expose them.
 
     # ~/.ssh is intentionally NOT bound. Read access to private keys lets a
     # compromised agent exfiltrate them over the (shared) network. Instead
@@ -212,13 +263,9 @@ args=(
 
     # --- Read-write paths ---
     --bind "$HOME/.moz-phab-config"   "$HOME/.moz-phab-config"
-    # Source tree (default $HOME/src, see SRC/CCODE_CWD_ONLY at top).
-    # cwd is always rw regardless of CCODE_CWD_ONLY; when cwd is under
-    # RW_ROOT the second bind is a no-op overlay.
+    --bind "$HOME/.profiler-cli"      "$HOME/.profiler-cli"
+    # Source tree (default $HOME/src, see SRC/MOZSB_CWD_ONLY at top).
     --bind "$RW_ROOT"                 "$RW_ROOT"
-    --bind "$CWD"                     "$CWD"
-    --bind "$HOME/.claude"            "$HOME/.claude"
-    --bind "$HOME/.claude.json"       "$HOME/.claude.json"
     --bind-try "$HOME/.local/share/rr"    "$HOME/.local/share/rr"
     --bind "$HOME/.mozbuild"          "$HOME/.mozbuild"
 
@@ -291,6 +338,31 @@ args=(
     --setenv GIT_CONFIG_VALUE_0 "$SBX/empty-hooks"
 )
 
+# Add only the selected agent's executable and state.
+if [[ "$MODE" == "claude" ]]; then
+    args+=(
+        --ro-bind-try "$HOME/.local/share/claude" "$HOME/.local/share/claude"
+        --ro-bind-try "$HOME/.config/claude"      "$HOME/.config/claude"
+        --bind-try    "$HOME/.claude"             "$HOME/.claude"
+        --bind-try    "$HOME/.claude.json"        "$HOME/.claude.json"
+    )
+elif [[ "$MODE" == "codex" ]]; then
+    CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+    CODEX_HOME="${CODEX_HOME/#\~/$HOME}"
+    mkdir -p "$CODEX_HOME"
+    CODEX_HOME="$(realpath -m "$CODEX_HOME")"
+    args+=(--bind "$CODEX_HOME" "$CODEX_HOME" --setenv CODEX_HOME "$CODEX_HOME")
+fi
+
+if [[ -n "$AGENT_BIN" ]]; then
+    args+=(--ro-bind "$_agent_real" "$_agent_real")
+    [[ -z "$_agent_package_root" ]] || args+=(--ro-bind "$_agent_package_root" "$_agent_package_root")
+    if [[ -n "$_agent_node" ]]; then
+        args+=(--ro-bind "$_agent_node" "$_agent_node")
+        [[ "$_agent_node_real" == "$_agent_node" ]] || args+=(--ro-bind "$_agent_node_real" "$_agent_node_real")
+    fi
+fi
+
 # Forward the GitHub token so gh(1) can authenticate inside the sandbox.
 # The token lives in the host keyring and is not present in ~/.config/gh,
 # so we read it at launch time. This is consistent with the existing bearer-
@@ -319,8 +391,9 @@ fi
 if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     _mbpath="$(realpath -m "$MOZBUILD_STATE_PATH")"
     _mapped=false
-    for _prefix in "$HOME/.mozbuild" "$RW_ROOT" "$CWD"; do
-        if [[ "$_mbpath" == "$(realpath -m "$_prefix")"* ]]; then
+    for _prefix in "$HOME/.mozbuild" "$RW_ROOT"; do
+        _prefix="$(realpath -m "$_prefix")"
+        if [[ "$_mbpath" == "$_prefix" || "$_mbpath" == "$_prefix"/* ]]; then
             _mapped=true
             break
         fi
@@ -333,7 +406,7 @@ if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     args+=(--setenv MOZBUILD_STATE_PATH "$MOZBUILD_STATE_PATH")
 fi
 
-if [[ -z "${CCODE_NO_SSH_AGENT:-}" ]]; then
+if [[ -z "${MOZSB_NO_SSH_AGENT:-${CCODE_NO_SSH_AGENT:-}}" ]]; then
   # Forward the ssh-agent socket if one is available on the host. The agent
   # inside the sandbox can use it for signing (e.g. ssh / git push) but cannot
   # read the underlying private keys.
@@ -345,8 +418,8 @@ if [[ -z "${CCODE_NO_SSH_AGENT:-}" ]]; then
   fi
 fi
 
-if [[ -n "${CCODE_EXTRA_BIN_DIR:-}" ]]; then
-    args+=(--ro-bind "$CCODE_EXTRA_BIN_DIR" "$CCODE_EXTRA_BIN_DIR")
+if [[ -n "$MOZSB_EXTRA_BIN_DIR" ]]; then
+    args+=(--ro-bind "$MOZSB_EXTRA_BIN_DIR" "$MOZSB_EXTRA_BIN_DIR")
 fi
 
 if [[ -n "$OPEN_PORT" ]]; then
@@ -377,35 +450,29 @@ args+=(
     --die-with-parent
 )
 
-# bypassPermissions: filesystem restrictions above replace claude's per-tool
-# permission prompts. --mcp-config wires up the rr MCP server if present.
-# Claude Code stores mcp-servers.json in either ~/.config/claude/ or ~/.claude/
-# depending on version/platform; check both and use the first match.
-MCP_CONFIG=""
-for _candidate in "$HOME/.config/claude/mcp-servers.json" "$HOME/.claude/mcp-servers.json"; do
-    if [[ -f "$_candidate" ]]; then
-        MCP_CONFIG="$_candidate"
-        break
-    fi
-done
-
-trap '[[ -n "${_OPEN_PID:-}" ]] && kill "$_OPEN_PID" 2>/dev/null; true' EXIT
-
 # bwrap runs in the background so this script stays alive to forward SIGWINCH
 # (see below). That backgrounding is why stdin has to be redirected explicitly:
 # bash points an asynchronous command's stdin at /dev/null unless the command
 # has a redirection of its own, and claude's TUI needs the real terminal on
 # stdin — without `<&0` it starts, hides the cursor and hangs forever.
-if [[ "${1:-}" == "--exec" ]]; then
-    shift
-    bwrap "${args[@]}" "$@" <&0 &
-else
-    bwrap "${args[@]}" \
-        "$(command -v claude)" \
-        --permission-mode bypassPermissions \
-        ${MCP_CONFIG:+--mcp-config "$MCP_CONFIG"} \
-        "$@" <&0 &
-fi
+case "$MODE" in
+    exec)
+        bwrap "${args[@]}" "$@" <&0 &
+        ;;
+    claude)
+        CLAUDE_ARGS=(--permission-mode bypassPermissions)
+        MCP_CONFIG=""
+        for _candidate in "$HOME/.config/claude/mcp-servers.json" "$HOME/.claude/mcp-servers.json"; do
+            if [[ -f "$_candidate" ]]; then MCP_CONFIG="$_candidate"; break; fi
+        done
+        [[ -n "$MCP_CONFIG" ]] && CLAUDE_ARGS+=(--mcp-config "$MCP_CONFIG")
+        bwrap "${args[@]}" "$_agent_real" "${CLAUDE_ARGS[@]}" "$@" <&0 &
+        ;;
+    codex)
+        bwrap "${args[@]}" "$_agent_real" \
+            --dangerously-bypass-approvals-and-sandbox "$@" <&0 &
+        ;;
+esac
 BWRAP_PID=$!
 
 # --new-session (above) detaches the sandboxed process into its own session
@@ -445,4 +512,3 @@ until wait "$BWRAP_PID"; do
     _status=$?
     kill -0 "$BWRAP_PID" 2>/dev/null || break
 done
-exit "$_status"

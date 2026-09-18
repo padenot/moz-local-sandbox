@@ -1,7 +1,7 @@
 .PHONY: test clean
 
 test:
-	./test/test-macos.sh
+	python3 -I -B test/test-security.py -v
 
 clean:
 	rm -rf bin

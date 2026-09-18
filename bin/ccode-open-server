@@ -21,16 +21,23 @@ LOOPBACK = {"localhost", "127.0.0.1"}
 
 
 def allowed(url):
+    # urllib and browsers disagree about backslashes in HTTP authorities.
+    # Validate before parsing: urllib also silently strips some control chars.
+    if not url or any(ord(c) <= 32 or ord(c) == 127 or c == "\\" for c in url):
+        return False
     try:
         p = urllib.parse.urlparse(url)
         scheme = p.scheme.lower()
         host = (p.hostname or "").lower()
+        if p.username is not None or p.password is not None:
+            return False
+        _ = p.port  # Reject malformed and out-of-range ports.
         if scheme not in ("http", "https"):
             return False
         if host in HTTPS_ONLY:
             return scheme == "https"
         return host in LOOPBACK
-    except Exception:
+    except ValueError:
         return False
 
 
@@ -39,7 +46,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         url = params.get("url", [""])[0]
         if not allowed(url):
-            print(f"DENY OPEN {url}", file=sys.stderr)
+            print(f"DENY OPEN {url!r}", file=sys.stderr)
             self.send_response(403)
             self.end_headers()
             return
@@ -53,7 +60,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-port = server.server_address[1]
-print(f"OPEN_PORT={port}", flush=True)
-server.serve_forever()
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    print(f"OPEN_PORT={port}", flush=True)
+    server.serve_forever()

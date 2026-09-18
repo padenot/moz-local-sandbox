@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Update sandbox npm configuration without following planted links."""
+import os
+import re
+import secrets
+import stat
+import sys
+
+
+def update(directory, prefix):
+    root = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = None
+    try:
+        try:
+            fd = os.open("npmrc", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=root)
+        except FileNotFoundError:
+            contents = ""
+        else:
+            with os.fdopen(fd, encoding="utf-8", errors="surrogateescape") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("sandbox npmrc must be a regular, unlinked file")
+                contents = source.read()
+        line = f"prefix={prefix}"
+        if line in contents.splitlines():
+            return
+        contents = re.sub(r"^prefix\s*=.*(?:\n|$)", "", contents, flags=re.MULTILINE)
+        temporary = "npmrc-" + secrets.token_hex(16)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=root)
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as output:
+            output.write(contents.rstrip("\n") + "\n" + line + "\n")
+        os.replace(temporary, "npmrc", src_dir_fd=root, dst_dir_fd=root)
+        temporary = None
+    finally:
+        if temporary is not None:
+            os.unlink(temporary, dir_fd=root)
+        os.close(root)
+
+
+if __name__ == "__main__":
+    update(*sys.argv[1:])

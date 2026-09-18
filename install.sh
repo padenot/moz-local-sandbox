@@ -38,8 +38,14 @@ if [[ -z "$TARGET_DIR" ]]; then
     esac
 fi
 
-ln -sf "$REPO/$BIN" "$TARGET_DIR/ccode"
-echo "Installed: $TARGET_DIR/ccode -> $REPO/$BIN"
+# Install a copy outside the writable source tree. A symlink into the checkout
+# would let a sandboxed agent replace code executed on the host next launch.
+mkdir -p "$HOME/.local/lib"
+INSTALL_DIR="$(mktemp -d "$HOME/.local/lib/mozsb.XXXXXXXX")"
+cp "$REPO/ccode" "$REPO/ccode-macos" "$INSTALL_DIR/"
+cp -R "$REPO/bin" "$INSTALL_DIR/bin"
+ln -sf "$INSTALL_DIR/$BIN" "$TARGET_DIR/mozsb"
+echo "Installed: $TARGET_DIR/mozsb -> $INSTALL_DIR/$BIN"
 
 if [[ ":$PATH:" != *":$TARGET_DIR:"* ]]; then
     echo "Note: $TARGET_DIR is not on your \$PATH. Add it, e.g.:"
