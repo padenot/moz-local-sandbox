@@ -100,6 +100,37 @@ else
     ok "source-root prefix siblings are rejected"
 fi
 
+
+cat > "$TMP/env" <<EOF
+# comment
+export CLAUDE_CODE_EFFORT_LEVEL=xhigh
+QUOTED="spaced value"
+TILDE=~/somewhere
+
+not a valid line
+BAD-KEY=x
+CLAUDE_CONFIG_DIR=$TMP/cfg
+EOF
+env_output=$(MOZSB_ENV_FILE="$TMP/env" run_launcher exec /usr/bin/true)
+if grep -q '^ARG=CLAUDE_CODE_EFFORT_LEVEL$' <<<"$env_output" && grep -q '^ARG=xhigh$' <<<"$env_output" && \
+   grep -q '^ARG=spaced value$' <<<"$env_output" && grep -q "^ARG=$HOME/somewhere\$" <<<"$env_output"; then
+    ok "env file entries reach the sandbox, unquoted and ~-expanded"
+else
+    fail "env file entries reach the sandbox, unquoted and ~-expanded"
+fi
+if grep -q 'ignoring malformed line.*not a valid line' <<<"$env_output" && \
+   grep -q 'ignoring malformed line.*BAD-KEY=x' <<<"$env_output" && \
+   ! grep -q '^ARG=BAD-KEY$' <<<"$env_output"; then
+    ok "malformed env file lines are reported and skipped"
+else
+    fail "malformed env file lines are reported and skipped"
+fi
+if grep -q "^ARG=$TMP/cfg\$" <<<"$env_output" && [[ -d "$TMP/cfg" ]]; then
+    ok "CLAUDE_CONFIG_DIR from the env file is created and bound"
+else
+    fail "CLAUDE_CONFIG_DIR from the env file is created and bound"
+fi
+
 echo "PASS: $PASS"
 echo "FAIL: $FAIL"
 if [[ $FAIL -gt 0 ]]; then exit 1; fi
