@@ -597,6 +597,42 @@ if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     ENV_ARGS+=(MOZBUILD_STATE_PATH="$MOZBUILD_STATE_PATH")
     PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$_mbpath")))"
 fi
+# --- User-supplied environment ---
+# env -i above drops the whole host environment, so anything you want in every
+# session has to be re-introduced here. Put it in ~/.config/mozsb/env (override
+# the path with MOZSB_ENV_FILE), one KEY=value per line; a leading `export `,
+# blank lines and # comments are ignored. Values are literal — no $VAR
+# expansion, no command substitution — except a leading ~/ which becomes
+# $HOME/. The file itself is never readable from inside the sandbox, so an API
+# key kept there is exposed only as an env var, same as GH_TOKEN above.
+_ENV_FILE="${MOZSB_ENV_FILE:-${CCODE_ENV_FILE:-$HOME/.config/mozsb/env}}"
+if [[ -f "$_ENV_FILE" ]]; then
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line#"${_line%%[![:space:]]*}"}"
+        [[ -z "$_line" || "$_line" == '#'* ]] && continue
+        _line="${_line#export }"
+        _key="${_line%%=*}"
+        if [[ "$_key" == "$_line" || ! "$_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "mozsb: ignoring malformed line in $_ENV_FILE: $_line" >&2
+            continue
+        fi
+        _val="${_line#*=}"
+        if [[ ${#_val} -ge 2 && ( "$_val" == \"*\" || "$_val" == \'*\' ) ]]; then
+            _val="${_val:1:${#_val}-2}"
+        fi
+        _val="${_val/#\~\//$HOME/}"
+        ENV_ARGS+=("$_key=$_val")
+        # A redirected agent config dir holds its settings, history and
+        # credentials, so it needs rw like the default ~/.claude or ~/.codex.
+        # Note the macOS login caveat at the top of this file: Claude Code
+        # also keeps state in ~/.claude.json and the keychain, so moving the
+        # config dir here can produce "you are not logged in" prompts.
+        if [[ "$_key" == "CLAUDE_CONFIG_DIR" || "$_key" == "CODEX_HOME" ]]; then
+            mkdir -p "$_val"
+            PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$(realpath "$_val")")))"
+        fi
+    done < "$_ENV_FILE"
+fi
 if [[ -z "${MOZSB_NO_SSH_AGENT:-${CCODE_NO_SSH_AGENT:-}}" && -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
     ENV_ARGS+=(SSH_AUTH_SOCK="$SSH_AUTH_SOCK")
 fi

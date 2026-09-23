@@ -406,6 +406,41 @@ if [[ -n "${MOZBUILD_STATE_PATH:-}" ]]; then
     args+=(--setenv MOZBUILD_STATE_PATH "$MOZBUILD_STATE_PATH")
 fi
 
+# --- User-supplied environment ---
+# --clearenv above drops the whole host environment, so anything you want in
+# every session has to be re-introduced here. Put it in ~/.config/mozsb/env
+# (override the path with MOZSB_ENV_FILE), one KEY=value per line; a leading
+# `export `, blank lines and # comments are ignored. Values are literal — no
+# $VAR expansion, no command substitution — except a leading ~/ which becomes
+# $HOME/. The file itself is never bound into the sandbox, so an API key kept
+# there is exposed only as an env var, same as GH_TOKEN above.
+_ENV_FILE="${MOZSB_ENV_FILE:-${CCODE_ENV_FILE:-$HOME/.config/mozsb/env}}"
+if [[ -f "$_ENV_FILE" ]]; then
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line#"${_line%%[![:space:]]*}"}"
+        [[ -z "$_line" || "$_line" == '#'* ]] && continue
+        _line="${_line#export }"
+        _key="${_line%%=*}"
+        if [[ "$_key" == "$_line" || ! "$_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "mozsb: ignoring malformed line in $_ENV_FILE: $_line" >&2
+            continue
+        fi
+        _val="${_line#*=}"
+        if [[ ${#_val} -ge 2 && ( "$_val" == \"*\" || "$_val" == \'*\' ) ]]; then
+            _val="${_val:1:${#_val}-2}"
+        fi
+        _val="${_val/#\~\//$HOME/}"
+        args+=(--setenv "$_key" "$_val")
+        # A redirected agent config dir holds its settings, history and
+        # credentials: it has to exist and be writable inside the sandbox,
+        # exactly like the default state directories bound above.
+        if [[ "$_key" == "CLAUDE_CONFIG_DIR" || "$_key" == "CODEX_HOME" ]]; then
+            mkdir -p "$_val"
+            args+=(--bind "$_val" "$_val")
+        fi
+    done < "$_ENV_FILE"
+fi
+
 if [[ -z "${MOZSB_NO_SSH_AGENT:-${CCODE_NO_SSH_AGENT:-}}" ]]; then
   # Forward the ssh-agent socket if one is available on the host. The agent
   # inside the sandbox can use it for signing (e.g. ssh / git push) but cannot

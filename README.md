@@ -51,8 +51,28 @@ checkout elsewhere. The home directory and its ancestors cannot be selected.
   interpreted and files can execute before cleanup runs.
 - `MOZSB_NO_SSH_AGENT=1` - disable SSH agent forwarding.
 - `MOZSB_CLAUDE_BIN=/path`, `MOZSB_CODEX_BIN=/path` - override agent discovery.
+- `MOZSB_ENV_FILE=/path` - read extra sandbox env vars from this file instead
+  of `~/.config/mozsb/env`.
 
 The former `CCODE_*` environment variable names remain accepted as aliases.
+
+The sandbox starts from an empty environment, so host `export`s never reach it.
+To set variables for every session, write `~/.config/mozsb/env`:
+
+```sh
+# one KEY=value per line; `export ` prefix, blank lines and # comments are fine
+CLAUDE_CODE_EFFORT_LEVEL=xhigh
+CLAUDE_CONFIG_DIR=~/.claude-separate-config
+ANTHROPIC_API_KEY=sk-...
+```
+
+Values are literal — no `$VAR` expansion or command substitution — except a
+leading `~/`, which expands to `$HOME/`. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
+are special-cased: the directory is created on the host and bound read-write
+into the sandbox, since that is where the agent then keeps its settings and
+credentials. The env file itself is never exposed to the sandbox, so keys in
+it are reachable only as environment variables — the same exposure as
+`GH_TOKEN` (see Residual risks).
 
 ### Opening URLs in the host browser
 
