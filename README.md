@@ -103,6 +103,10 @@ precautions above also apply. Verify the sandbox policy with isolated fixtures:
 make test
 ```
 
+`make test-live` runs real `claude` (haiku) and `codex` (gpt-6-luna) through
+the launcher with your logins: one cheap prompt each, which must run a shell
+command in the sandbox and answer. Run it locally after changing the policy.
+
 ## What's exposed
 
 Roughly: system binaries/libs read-only; VCS credentials (`gh`, `jj`, `.gitconfig`,

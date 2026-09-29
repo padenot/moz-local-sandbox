@@ -329,6 +329,9 @@ PROFILE=$(cat <<SBPROFILE
 (allow network-outbound network-bind network-inbound
   (subpath $(sb_quote "$RW_ROOT"))
   (subpath $(sb_quote "$SBX")))
+;; DNS: the libc resolver talks to mDNSResponder over this socket. Denied,
+;; name resolution hangs until timeout (e.g. claude never reaches its API).
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
 
 ;; --- Read-only system filesystems ---
 ;; Root-level entries are allowed so that path traversal into the allowed
@@ -432,7 +435,9 @@ SBPROFILE
 # CODEX_HOME. Optional shared ~/.agents skills are deliberately not exposed.
 if [[ "$MODE" == "claude" ]]; then
     PROFILE+=$'\n'"(allow file-read* (subpath $(sb_quote "$HOME/.local/share/claude")) (subpath $(sb_quote "$HOME/.config/claude")))"
-    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$HOME/.claude")) (literal $(sb_quote "$HOME/.claude.json")))"
+    # ~/.claude.json is saved via sibling .lock/.tmp.* files and a rename;
+    # without them every save of it fails.
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$HOME/.claude")) (literal $(sb_quote "$HOME/.claude.json")) (prefix $(sb_quote "$HOME/.claude.json.")))"
     PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$HOME/Library/Keychains")) (subpath \"/Library/Keychains\") (subpath \"/private/var/db/SystemKey\") (subpath \"/private/var/db/mds\"))"
 elif [[ "$MODE" == "codex" ]]; then
     CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
