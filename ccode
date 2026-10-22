@@ -525,14 +525,125 @@ if [[ -n "$OPEN_PORT" ]]; then
         --setenv  CCODE_OPEN_PORT             "$OPEN_PORT"
     )
     if [[ -n "$CLIPBOARD_TOKEN" ]]; then
-        # Claude Code only uses wl-copy when WAYLAND_DISPLAY is set. The
-        # socket itself is not mounted: the shims are the only way out.
+        # Claude Code only uses wl-copy when WAYLAND_DISPLAY is set. Unless
+        # MOZSB_ENABLE_WAYLAND=1, the socket itself is not mounted: the shims
+        # are the only way out.
         args+=(
             --ro-bind "$REPO_DIR/bin/ccode-wl-paste" /opt/ccode-bin/wl-paste
             --ro-bind "$REPO_DIR/bin/ccode-wl-copy"  /opt/ccode-bin/wl-copy
             --ro-bind "$RUNTIME_DIR/clipboard-token" /opt/ccode-clipboard-token
             --setenv  WAYLAND_DISPLAY                "$WAYLAND_DISPLAY"
         )
+    fi
+fi
+
+# Opt-in access to the Wayland compositor, so that programs such as Firefox can
+# open windows. A compromised agent can then talk to the compositor directly
+# (read the clipboard when focused, draw windows that imitate other apps).
+if [[ "${MOZSB_ENABLE_WAYLAND:-0}" == 1 ]]; then
+    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        WAYLAND_SOCK="${WAYLAND_DISPLAY:-wayland-0}"
+        args+=(
+            --ro-bind "$XDG_RUNTIME_DIR/$WAYLAND_SOCK" "$XDG_RUNTIME_DIR/$WAYLAND_SOCK"
+            --setenv  XDG_RUNTIME_DIR                  "$XDG_RUNTIME_DIR"
+            --setenv  WAYLAND_DISPLAY                  "$WAYLAND_SOCK"
+        )
+    else
+        echo "mozsb: warning: XDG_RUNTIME_DIR is not set, not exposing the Wayland socket" >&2
+    fi
+fi
+
+# Opt-in access to the GPU, for hardware accelerated rendering, video decoding
+# and compute. The GPU kernel driver is a large attack surface: a bug in it is
+# a way out of the sandbox.
+if [[ "${MOZSB_ENABLE_GRAPHICS:-0}" == 1 ]]; then
+    # Only a render node is exposed. Rendering, video decoding and compute all
+    # go through it; the primary node (/dev/dri/cardN) controls the displays
+    # and adds kernel attack surface without being needed for any of that.
+    # MOZSB_GPU selects a GPU by render node name (renderD129) or PCI slot
+    # (0000:01:00.0), for machines with more than one. Otherwise use the GPU the
+    # firmware booted the display on, or the first one if none is marked.
+    _render_node=""
+    for _node in /sys/class/drm/renderD*; do
+        [[ -e "$_node/device" ]] || continue
+        if [[ -n "${MOZSB_GPU:-}" ]]; then
+            _slot="$(realpath -e "$_node/device")"; _slot="${_slot##*/}"
+            if [[ "$MOZSB_GPU" == "${_node##*/}" || "$MOZSB_GPU" == "$_slot" ]]; then
+                _render_node="$_node"; break
+            fi
+            continue
+        fi
+        [[ -n "$_render_node" ]] || _render_node="$_node"
+        if [[ "$(cat "$_node/device/boot_vga" 2>/dev/null)" == 1 ]]; then
+            _render_node="$_node"; break
+        fi
+    done
+    if [[ -n "${MOZSB_GPU:-}" && -z "$_render_node" ]]; then
+        echo "mozsb: GPU=$MOZSB_GPU does not match any render node or PCI slot in /sys/class/drm" >&2
+        exit 1
+    fi
+    if [[ -n "$_render_node" ]]; then
+        _node_name="${_render_node##*/}"
+        # libdrm, Mesa and Firefox read sysfs to identify the GPU and pick a
+        # driver. Rather than binding whole sysfs trees, which would expose
+        # every PCI device, monitor EDIDs (with serial numbers) and live GPU
+        # load and memory readings, rebuild the small part they read: the
+        # GPU's identity files, its render node directory and the symlinks
+        # that lead to them. sysfs symlinks are relative, so copying their
+        # targets keeps them working inside the sandbox.
+        GPU_SYSFS="$(realpath -e "$_render_node/device")"
+        _gpu_subsys="$(realpath -m "$GPU_SYSFS/subsystem")"
+        _char_link="/sys/dev/char/$(cat "$_render_node/dev")"
+        _bus_link="$_gpu_subsys/devices/${GPU_SYSFS##*/}"
+        args+=(
+            --dev-bind "/dev/dri/$_node_name" "/dev/dri/$_node_name"
+            --tmpfs "$GPU_SYSFS"
+            --ro-bind "$GPU_SYSFS/drm/$_node_name" "$GPU_SYSFS/drm/$_node_name"
+            --dir "$_gpu_subsys"
+            --symlink "$(readlink "$GPU_SYSFS/subsystem")" "$GPU_SYSFS/subsystem"
+            --symlink "$(readlink "$_render_node")" "/sys/class/drm/$_node_name"
+            --symlink "$(readlink "$_char_link")" "$_char_link"
+        )
+        _gpu_driver=""
+        if [[ -L "$GPU_SYSFS/driver" ]]; then
+            _gpu_driver="$(realpath -m "$GPU_SYSFS/driver")"
+            args+=(
+                --dir "$_gpu_driver"
+                --symlink "$(readlink "$GPU_SYSFS/driver")" "$GPU_SYSFS/driver"
+            )
+        fi
+        # Firefox's startup GPU probe scans /sys/bus/pci/devices with libpci.
+        [[ ! -L "$_bus_link" ]] || args+=(--symlink "$(readlink "$_bus_link")" "$_bus_link")
+        for _file in vendor device subsystem_vendor subsystem_device revision class uevent boot_vga; do
+            args+=(--ro-bind-try "$GPU_SYSFS/$_file" "$GPU_SYSFS/$_file")
+        done
+        case "${_gpu_driver##*/}" in
+            # Mesa drivers: the render node is enough.
+            amdgpu|radeon|i915|xe|nouveau|virtio-pci|virtio_gpu) ;;
+            nvidia)
+                # NVIDIA's proprietary userspace renders through its own
+                # device nodes and uses the render node only to allocate
+                # buffers for Wayland. /dev/nvidia-uvm (CUDA) is left out.
+                # The nodes are often created on first use by nvidia-modprobe,
+                # which cannot run in the sandbox, so some may be missing.
+                _nv_info="/proc/driver/nvidia/gpus/${GPU_SYSFS##*/}/information"
+                _nv_minor="$(sed -n 's/^Device Minor:[[:space:]]*//p' "$_nv_info" 2>/dev/null || true)"
+                [[ -n "$_nv_minor" ]] || echo "mozsb: warning: cannot read the device minor from $_nv_info" >&2
+                for _dev in /dev/nvidiactl ${_nv_minor:+"/dev/nvidia$_nv_minor"} /dev/nvidia-modeset; do
+                    if [[ -e "$_dev" ]]; then args+=(--dev-bind "$_dev" "$_dev")
+                    else echo "mozsb: warning: $_dev does not exist, not exposing it" >&2; fi
+                done
+                # Some distros install NVIDIA's Vulkan and EGL config here.
+                args+=(
+                    --ro-bind-try /etc/vulkan /etc/vulkan
+                    --ro-bind-try /etc/glvnd  /etc/glvnd
+                    --ro-bind-try /etc/egl    /etc/egl
+                )
+                ;;
+            *) echo "mozsb: warning: untested GPU driver '${_gpu_driver##*/}', exposing only its render node" >&2 ;;
+        esac
+    else
+        echo "mozsb: warning: no GPU render node found, not exposing the GPU" >&2
     fi
 fi
 

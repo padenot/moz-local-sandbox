@@ -83,6 +83,9 @@ CWD_ONLY = 1
 | `EXTRA_RO_DIRS` | Expose a directory read-only, without adding it to `PATH`; repeat for multiple directories. |
 | `EXTRA_BIN_DIR` | Expose a directory read-only and prepend it to `PATH`. |
 | `NO_SSH_AGENT` | Disable SSH agent forwarding when set to `1`. |
+| `ENABLE_WAYLAND` | On Linux, expose the Wayland socket so programs can open windows when set to `1`; see Residual risks. |
+| `ENABLE_GRAPHICS` | On Linux, expose one GPU render node (`/dev/dri/renderD*`) and the sysfs files that identify that GPU when set to `1`; see Residual risks. |
+| `GPU` | With `ENABLE_GRAPHICS`, select the GPU by render node (`renderD129`) or PCI slot (`0000:01:00.0`). Default: the GPU the display booted on. |
 | `NOEXEC` | On macOS, remove newly gained execute bits on exit when set to `1`; see the details below. |
 | `CLAUDE_BIN`, `CODEX_BIN` | Set the path to the agent executable. |
 | `ENV_FILE` | Read sandbox environment variables from a different file. |
@@ -118,6 +121,9 @@ explicitly select only the current directory.
   an exit-time convenience, not an execution barrier; scripts can still be
   interpreted and files can execute before cleanup runs.
 - `MOZSB_NO_SSH_AGENT=1` - disable SSH agent forwarding.
+- `MOZSB_ENABLE_WAYLAND=1` (Linux) - expose the Wayland socket.
+- `MOZSB_ENABLE_GRAPHICS=1` (Linux) - expose a GPU render node.
+- `MOZSB_GPU=renderD129` or `MOZSB_GPU=0000:01:00.0` (Linux) - select the GPU exposed by `MOZSB_ENABLE_GRAPHICS`.
 - `MOZSB_CLAUDE_BIN=/path`, `MOZSB_CODEX_BIN=/path` - override agent discovery.
 - `MOZSB_ENV_FILE=/path` - read extra sandbox env vars from this file instead
   of `~/.config/mozsb/env`.
@@ -172,12 +178,13 @@ host network namespace, and macOS exposes LaunchServices (see Residual risks).
 
 ### Clipboard (Linux, Wayland)
 
-The Wayland socket is not mounted. Instead, `wl-paste`/`wl-copy` are shadowed
-by shims that go through the same host-side server (it needs `wl-clipboard`
-installed on the host). The sandbox can paste images (screenshots into claude)
-and write text (`/copy`), but cannot read text from the clipboard, which may
-hold passwords; paste text with the terminal (Ctrl+Shift+V) instead. Requests
-carry a per-session token so other local processes cannot use the broker.
+If `ENABLE_WAYLAND` is not set, the Wayland socket is not mounted.
+Instead, `wl-paste`/`wl-copy` are shadowed by shims that go through the same
+host-side server (it needs `wl-clipboard` installed on the host).
+The sandbox can paste images (screenshots into claude) and write text (`/copy`),
+but cannot read text from the clipboard, which may hold passwords; paste text with
+the terminal (Ctrl+Shift+V) instead. Requests carry a per-session token so other
+local processes cannot use the broker.
 
 ## Host setup
 
@@ -259,6 +266,15 @@ The sandbox reduces blast radius, it doesn't eliminate it:
   sockets. Depending on desktop authentication, X11/Xwayland may be reachable
   without mounting its filesystem socket. Loopback services are also reachable
   on both platforms. Filesystem isolation does not protect these services.
+- **Linux: `ENABLE_WAYLAND=1` exposes the Wayland compositor.** The blast radius
+  of this setting depends on the compositor. On GNOME/KDE, a compromised agent
+  can open windows that imitate other apps and read the clipboard when
+  one of its windows has focus. On wlroots compositors (Sway, Hyprland, river
+  and similar), every client can bind privileged protocols by default which
+  allows a lot of dangerous things like reading the clipboard at any time,
+  taking screenshots and injecting keystrokes. It is off by default.
+- **Linux: `ENABLE_GRAPHICS=1` exposes the GPU kernel driver.** A bug in the
+  driver is a way out of the sandbox. It is off by default.
 - **Bearer tokens (gh/arc/moz-phab) are readable**, not just unmodifiable — a
   compromised agent could exfiltrate them over the network.
 - **`~/.claude`/`~/.claude.json` are shared with host claude**, read-write —

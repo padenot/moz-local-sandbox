@@ -189,7 +189,7 @@ esac
 source "$1/bin/ccode-config"
 printf 'SRC=%s\n' "${_cfg_global[@]-}"
 printf 'MATCH_SRC=%s\n' "${_cfg_match[@]-}"
-printf 'RO=%s\nBIN=%s\nSSH=%s\nAGENT=%s\n' "$MOZSB_EXTRA_RO_DIRS" "${MOZSB_EXTRA_BIN_DIR-}" "${MOZSB_NO_SSH_AGENT-}" "${MOZSB_CODEX_BIN-}"
+printf 'RO=%s\nBIN=%s\nSSH=%s\nAGENT=%s\nWL=%s\nGFX=%s\nGPU=%s\n' "$MOZSB_EXTRA_RO_DIRS" "${MOZSB_EXTRA_BIN_DIR-}" "${MOZSB_NO_SSH_AGENT-}" "${MOZSB_CODEX_BIN-}" "${MOZSB_ENABLE_WAYLAND-}" "${MOZSB_ENABLE_GRAPHICS-}" "${MOZSB_GPU-}"
 ''', "config-test", REPO], extra=extra, cwd=cwd)
 
     def test_config_directory_and_precedence(self):
@@ -205,6 +205,9 @@ CODEX_BIN = /config/codex
 [~/src]
 EXTRA_RO_DIRS = ~/checkout-reference
 NO_SSH_AGENT = 1
+ENABLE_WAYLAND = 1
+ENABLE_GRAPHICS = 1
+GPU = 0000:01:00.0
 [~/src/nested]
 SRC = ~/src/nested
 EXTRA_RO_DIRS = ~/nested-reference
@@ -223,6 +226,9 @@ EXTRA_RO_DIRS = ~/nested-reference
         result = self.config_settings(extra=extra)
         self.assert_ok(result)
         self.assertIn("RO=~/checkout-reference\n", result.stdout)
+        self.assertIn("WL=1\n", result.stdout)
+        self.assertIn("GFX=1\n", result.stdout)
+        self.assertIn("GPU=0000:01:00.0\n", result.stdout)
         nested = self.work / "nested"
         nested.mkdir()
         result = self.config_settings(extra=extra, cwd=nested)
@@ -237,6 +243,8 @@ EXTRA_RO_DIRS = ~/nested-reference
         result = self.config_settings(extra={**extra, "MOZSB_NO_SSH_AGENT": None}, cwd=self.home)
         self.assert_ok(result)
         self.assertIn("SSH=0\n", result.stdout)
+        self.assertIn("WL=\n", result.stdout)
+        self.assertIn("GFX=\n", result.stdout)
         for override in [{"MOZSB_EXTRA_RO_DIRS": "/override"},
                          {"CCODE_EXTRA_RO_DIRS": "/override"},
                          {"MOZSB_EXTRA_RO_DIRS": ""}]:

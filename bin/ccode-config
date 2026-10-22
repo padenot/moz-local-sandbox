@@ -57,7 +57,7 @@ if [[ -f "$_config" ]]; then
             EXTRA_RO_DIRS)
                 if [[ "$_scope" == global ]]; then _global_ro+=("$_value")
                 else _match_ro+=("$_value"); fi ;;
-            CWD_ONLY|EXTRA_BIN_DIR|NOEXEC|NO_SSH_AGENT|CLAUDE_BIN|CODEX_BIN|ENV_FILE)
+            CWD_ONLY|EXTRA_BIN_DIR|NOEXEC|NO_SSH_AGENT|ENABLE_WAYLAND|ENABLE_GRAPHICS|GPU|CLAUDE_BIN|CODEX_BIN|ENV_FILE)
                 printf -v "_${_scope}_${_key}" '%s' "$(_expand_src "$_value")" ;;
             *) echo "mozsb: ignoring unknown config key in $_config: $_key" >&2 ;;
         esac
@@ -65,7 +65,7 @@ if [[ -f "$_config" ]]; then
 fi
 _global_only="${_global_CWD_ONLY:-}"; _match_only="${_match_CWD_ONLY:-}"
 # Only known launcher variables can be assigned. Values remain literal data.
-for _key in EXTRA_BIN_DIR NOEXEC NO_SSH_AGENT CLAUDE_BIN CODEX_BIN ENV_FILE; do
+for _key in EXTRA_BIN_DIR NOEXEC NO_SSH_AGENT ENABLE_WAYLAND ENABLE_GRAPHICS GPU CLAUDE_BIN CODEX_BIN ENV_FILE; do
     _env_key="MOZSB_$_key"; _alias_key="CCODE_$_key"
     _match_key="_match_$_key"; _global_key="_global_$_key"
     if [[ -z "${!_env_key+x}" ]]; then
