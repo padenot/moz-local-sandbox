@@ -434,6 +434,7 @@ fi
 [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]] && args+=(--setenv CARGO_REGISTRY_TOKEN "$CARGO_REGISTRY_TOKEN")
 [[ -n "${MATURIN_PYPI_TOKEN:-}" ]]   && args+=(--setenv MATURIN_PYPI_TOKEN   "$MATURIN_PYPI_TOKEN")
 [[ -n "${UV_PUBLISH_TOKEN:-}" ]]     && args+=(--setenv UV_PUBLISH_TOKEN     "$UV_PUBLISH_TOKEN")
+[[ -n "${REDASH_API_KEY:-}" ]]    && args+=(--setenv REDASH_API_KEY    "$REDASH_API_KEY")
 # MOZCONFIG points to a directory that may contain executables (compilers,
 # build tools, wrappers). Like the sandbox-private toolchain caches, a
 # compromised agent could drop malicious binaries here for the host to pick
