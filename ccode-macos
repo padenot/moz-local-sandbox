@@ -618,11 +618,11 @@ if _GH_TOKEN=$(gh auth token 2>/dev/null) && [[ -n "$_GH_TOKEN" ]]; then
     ENV_ARGS+=(GH_TOKEN="$_GH_TOKEN")
 fi
 [[ -n "${PHABRICATOR_TOKEN:-}" ]]    && ENV_ARGS+=(PHABRICATOR_TOKEN="$PHABRICATOR_TOKEN")
-[[ -n "${BMO_API_KEY:-}" ]]         && ENV_ARGS+=(BMO_API_KEY="$BMO_API_KEY")
+[[ -n "${BMO_API_KEY:-}" ]]          && ENV_ARGS+=(BMO_API_KEY="$BMO_API_KEY")
 [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]] && ENV_ARGS+=(CARGO_REGISTRY_TOKEN="$CARGO_REGISTRY_TOKEN")
 [[ -n "${MATURIN_PYPI_TOKEN:-}" ]]   && ENV_ARGS+=(MATURIN_PYPI_TOKEN="$MATURIN_PYPI_TOKEN")
 [[ -n "${UV_PUBLISH_TOKEN:-}" ]]     && ENV_ARGS+=(UV_PUBLISH_TOKEN="$UV_PUBLISH_TOKEN")
-[[ -n "${REDASH_API_KEY:-}" ]]     && ENV_ARGS+=(REDASH_API_KEY="$REDASH_API_KEY")
+[[ -n "${REDASH_API_KEY:-}" ]]       && ENV_ARGS+=(REDASH_API_KEY="$REDASH_API_KEY")
 # MOZCONFIG points to a directory that may contain executables (compilers,
 # build tools, wrappers). Like the sandbox-private toolchain caches, a
 # compromised agent could drop malicious binaries here for the host to pick
