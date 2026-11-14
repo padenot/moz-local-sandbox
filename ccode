@@ -25,13 +25,13 @@ done
 REPO_DIR="$(cd "$(dirname "$_self")" && pwd -P)"
 
 usage() {
-    echo "usage: mozsb {claude|codex|exec} [args...]" >&2
+    echo "usage: mozsb {claude|codex|pi|exec} [args...]" >&2
     exit 2
 }
 
 MODE="${1:-}"
 case "$MODE" in
-    claude|codex|exec) shift ;;
+    claude|codex|pi|exec) shift ;;
     *) usage ;;
 esac
 [[ "$MODE" != "exec" || $# -gt 0 ]] || usage
@@ -45,6 +45,8 @@ if [[ "$MODE" != "exec" ]]; then
         AGENT_BIN="$MOZSB_CODEX_BIN"
     elif [[ "$MODE" == "claude" && -n "${MOZSB_CLAUDE_BIN:-}" ]]; then
         AGENT_BIN="$MOZSB_CLAUDE_BIN"
+    elif [[ "$MODE" == "pi" && -n "${MOZSB_PI_BIN:-}" ]]; then
+        AGENT_BIN="$MOZSB_PI_BIN"
     else
         AGENT_BIN="$(command -v "$MODE" 2>/dev/null || true)"
     fi
@@ -409,6 +411,22 @@ elif [[ "$MODE" == "codex" ]]; then
     mkdir -p "$CODEX_HOME"
     CODEX_HOME="$(realpath -m "$CODEX_HOME")"
     args+=(--bind "$CODEX_HOME" "$CODEX_HOME" --setenv CODEX_HOME "$CODEX_HOME")
+elif [[ "$MODE" == "pi" ]]; then
+    # The agent dir holds auth, settings and sessions, and also the managed
+    # install (launcher and releases). The code parts are mounted read-only
+    # over the writable bind so the sandbox cannot plant code that the host
+    # runs later. The Pi installer's private Node, if present, is read-only.
+    PI_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+    PI_DIR="${PI_DIR/#\~/$HOME}"
+    mkdir -p "$PI_DIR"
+    PI_DIR="$(realpath -m "$PI_DIR")"
+    args+=(
+        --bind "$PI_DIR" "$PI_DIR"
+        --ro-bind-try "$PI_DIR/bin"     "$PI_DIR/bin"
+        --ro-bind-try "$PI_DIR/install" "$PI_DIR/install"
+        --ro-bind-try "$HOME/.local/share/pi-node" "$HOME/.local/share/pi-node"
+        --setenv PI_CODING_AGENT_DIR "$PI_DIR"
+    )
 fi
 [[ "$MODE" == "claude" && -n "${CLAUDE_CONFIG_DIR:-}" ]] && args+=(--setenv CLAUDE_CONFIG_DIR "$CLAUDE_CONFIG_DIR")
 
@@ -493,7 +511,7 @@ if [[ -f "$_ENV_FILE" ]]; then
         # A redirected agent config dir holds its settings, history and
         # credentials: it has to exist and be writable inside the sandbox,
         # exactly like the default state directories bound above.
-        if [[ "$_key" == "CLAUDE_CONFIG_DIR" || "$_key" == "CODEX_HOME" ]]; then
+        if [[ "$_key" == "CLAUDE_CONFIG_DIR" || "$_key" == "CODEX_HOME" || "$_key" == "PI_CODING_AGENT_DIR" ]]; then
             mkdir -p "$_val"
             args+=(--bind "$_val" "$_val")
         fi
@@ -699,6 +717,10 @@ case "$MODE" in
         [[ "$_no_daemon" == "1" ]] || CODEX_ARGS+=(--no-daemon)
         bwrap "${args[@]}" "$_agent_real" \
             "${CODEX_ARGS[@]}" "$@" <&0 &
+        ;;
+    pi)
+        # Pi has no sandbox or approval layer of its own, so no flags are needed.
+        bwrap "${args[@]}" "$_agent_real" "$@" <&0 &
         ;;
 esac
 BWRAP_PID=$!

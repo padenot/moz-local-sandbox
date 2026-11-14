@@ -31,7 +31,11 @@ cat > "$TMP/bin/claude" <<'STUB'
 #!/bin/bash
 exit 0
 STUB
-chmod +x "$TMP/bin/bwrap" "$TMP/bin/realpath" "$TMP/bin/codex" "$TMP/bin/claude"
+cat > "$TMP/bin/pi" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$TMP/bin/bwrap" "$TMP/bin/realpath" "$TMP/bin/codex" "$TMP/bin/claude" "$TMP/bin/pi"
 
 PASS=0
 FAIL=0
@@ -55,6 +59,24 @@ if grep -q "$HOME/.codex" <<<"$codex_output" && ! grep -q "$HOME/.claude" <<<"$c
     ok "Codex bwrap mounts expose Codex state only"
 else
     fail "Codex bwrap mounts expose Codex state only"
+fi
+
+pi_output=$(MOZSB_PI_BIN="$TMP/bin/pi" run_launcher pi marker)
+if [[ "$(tail -n 2 <<<"$pi_output")" == "ARG=$(realpath "$TMP/bin/pi")"$'\nARG=marker' ]]; then
+    ok "Pi receives user args without extra flags"
+else
+    fail "Pi receives user args without extra flags"
+fi
+if grep -q "$HOME/.pi/agent" <<<"$pi_output" && ! grep -q "$HOME/.claude" <<<"$pi_output" && \
+   ! grep -q "$HOME/.codex" <<<"$pi_output"; then
+    ok "Pi bwrap mounts expose Pi state only"
+else
+    fail "Pi bwrap mounts expose Pi state only"
+fi
+if grep -A2 '^ARG=--ro-bind-try$' <<<"$pi_output" | grep -q "^ARG=$HOME/.pi/agent/install$"; then
+    ok "Pi install directory is mounted read-only"
+else
+    fail "Pi install directory is mounted read-only"
 fi
 
 check_codex_args() {
