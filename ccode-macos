@@ -474,7 +474,7 @@ if [[ "$MODE" == "claude" ]]; then
     PROFILE+=$'\n'"(allow file-read* (subpath $(sb_quote "$HOME/.local/share/claude")) (subpath $(sb_quote "$HOME/.config/claude")))"
     # ~/.claude.json is saved via sibling .lock/.tmp.* files and a rename;
     # without them every save of it fails.
-    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$CLAUDE_CONFIG")) (literal $(sb_quote "$HOME/.claude.json")) (prefix $(sb_quote "$HOME/.claude.json.")))"
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$CLAUDE_CONFIG")) (literal $(sb_quote "$HOME/.claude.json")) (prefix $(sb_quote "$HOME/.claude.json.")) (subpath $(sb_quote "$HOME/.config/anthropic")))"
     PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$HOME/Library/Keychains")) (subpath \"/Library/Keychains\") (subpath \"/private/var/db/SystemKey\") (subpath \"/private/var/db/mds\"))"
 elif [[ "$MODE" == "codex" ]]; then
     CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
