@@ -397,7 +397,12 @@ if [[ "$MODE" == "claude" ]]; then
     CLAUDE_CONFIG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     mkdir -p "$CLAUDE_CONFIG"
     CLAUDE_CONFIG="$(realpath -m "$CLAUDE_CONFIG")"
+    # Claude Code >= 2.1.326 keeps its login in ~/.config/anthropic and writes
+    # refreshed tokens back there. Create it so a login made inside the
+    # sandbox persists instead of landing in the throwaway ~/.config.
+    mkdir -p "$HOME/.config/anthropic"
     args+=(
+        --bind-try    "$HOME/.config/anthropic"   "$HOME/.config/anthropic"
         --ro-bind-try "$HOME/.local/share/claude" "$HOME/.local/share/claude"
         --ro-bind-try "$HOME/.config/claude"      "$HOME/.config/claude"
         --bind-try    "$CLAUDE_CONFIG"            "$CLAUDE_CONFIG"
