@@ -1,6 +1,6 @@
 # moz-local-sandbox
 
-Sandbox for running Claude Code (`claude`) or Codex (`codex`) against a
+Sandbox for running Claude Code (`claude`), Codex (`codex`) or Pi (`pi`) against a
 Firefox checkout.
 
 - **Linux:** `bwrap`-based, supports `rr` via rr-mcp. Script: `ccode`.
@@ -19,6 +19,7 @@ Otherwise, see [Configuration](#configuration) below to change the defaults.
 ```
 mozsb claude [claude-args...]
 mozsb codex [codex-args...]
+mozsb pi [pi-args...]
 mozsb exec PROGRAM [args...]
 ```
 
@@ -33,6 +34,8 @@ for various things under and in `mach`). Claude MCP config is passed through
 automatically if present; Codex reads its normal `$CODEX_HOME/config.toml`.
 On both platforms, Codex runs with `--no-daemon` to keep its app server inside
 the outer sandbox. This requires a Codex version that supports `--no-daemon`.
+Pi has no approval layer, so it runs without extra flags. It uses its state
+directory `$PI_CODING_AGENT_DIR` (default `~/.pi/agent`).
 
 `./install.sh` copies the launchers and helpers into `~/.local/lib/mozsb.*`
 and symlinks the OS-appropriate installed copy as `mozsb`. Re-run it after
@@ -87,7 +90,7 @@ CWD_ONLY = 1
 | `ENABLE_GRAPHICS` | On Linux, expose one GPU render node (`/dev/dri/renderD*`) and the sysfs files that identify that GPU when set to `1`; see Residual risks. |
 | `GPU` | With `ENABLE_GRAPHICS`, select the GPU by render node (`renderD129`) or PCI slot (`0000:01:00.0`). Default: the GPU the display booted on. |
 | `NOEXEC` | On macOS, remove newly gained execute bits on exit when set to `1`; see the details below. |
-| `CLAUDE_BIN`, `CODEX_BIN` | Set the path to the agent executable. |
+| `CLAUDE_BIN`, `CODEX_BIN`, `PI_BIN` | Set the path to the agent executable. |
 | `ENV_FILE` | Read sandbox environment variables from a different file. |
 
 Use `1` to enable flags and `0` to disable them. Extra read-only and bin
@@ -124,7 +127,7 @@ explicitly select only the current directory.
 - `MOZSB_ENABLE_WAYLAND=1` (Linux) - expose the Wayland socket.
 - `MOZSB_ENABLE_GRAPHICS=1` (Linux) - expose a GPU render node.
 - `MOZSB_GPU=renderD129` or `MOZSB_GPU=0000:01:00.0` (Linux) - select the GPU exposed by `MOZSB_ENABLE_GRAPHICS`.
-- `MOZSB_CLAUDE_BIN=/path`, `MOZSB_CODEX_BIN=/path` - override agent discovery.
+- `MOZSB_CLAUDE_BIN=/path`, `MOZSB_CODEX_BIN=/path`, `MOZSB_PI_BIN=/path` - override agent discovery.
 - `MOZSB_ENV_FILE=/path` - read extra sandbox env vars from this file instead
   of `~/.config/mozsb/env`.
 
@@ -145,8 +148,8 @@ ANTHROPIC_API_KEY=sk-...
 ```
 
 Values are literal — no `$VAR` expansion or command substitution — except a
-leading `~/`, which expands to `$HOME/`. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
-are special-cased: the directory is created on the host and bound read-write
+leading `~/`, which expands to `$HOME/`. `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and
+`PI_CODING_AGENT_DIR` are special-cased: the directory is created on the host and bound read-write
 into the sandbox, since that is where the agent then keeps its settings and
 credentials. The env file itself is never exposed to the sandbox, so keys in
 it are reachable only as environment variables — the same exposure as
@@ -285,6 +288,12 @@ The sandbox reduces blast radius, it doesn't eliminate it:
   compromised sandbox can alter settings, sessions, skills, plugins, or MCP
   configuration used by host Codex later. It is not exposed in Claude or
   `exec` mode.
+- **`$PI_CODING_AGENT_DIR` (default `~/.pi/agent`) is shared with host Pi in
+  Pi mode**, read-write — a compromised sandbox can alter settings, sessions,
+  extensions, skills, or stored credentials used by host Pi later. Its `bin`
+  and `install` subdirectories (the launcher and managed releases) are
+  read-only, so `pi update` does not work inside the sandbox. It is not
+  exposed in Claude, Codex or `exec` mode.
 - **macOS has no PID isolation** — the agent can enumerate host processes
   (not signal them).
 - **macOS: `sandbox-exec` is deprecated** by Apple; still kernel-enforced

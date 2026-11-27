@@ -30,8 +30,8 @@ done
 REPO_DIR="$(cd "$(dirname "$_self")" && pwd -P)"
 
 usage() {
-    echo "usage: mozsb {claude|codex|exec} [args...]" >&2
-    echo "       mozsb --print-profile {claude|codex|exec}" >&2
+    echo "usage: mozsb {claude|codex|pi|exec} [args...]" >&2
+    echo "       mozsb --print-profile {claude|codex|pi|exec}" >&2
     exit 2
 }
 
@@ -42,7 +42,7 @@ if [[ "${1:-}" == "--print-profile" ]]; then
 fi
 MODE="${1:-}"
 case "$MODE" in
-    claude|codex|exec) shift ;;
+    claude|codex|pi|exec) shift ;;
     *) usage ;;
 esac
 [[ "$MODE" != "exec" || $# -gt 0 ]] || usage
@@ -56,6 +56,8 @@ if [[ "$MODE" != "exec" ]]; then
         AGENT_BIN="$MOZSB_CODEX_BIN"
     elif [[ "$MODE" == "claude" && -n "${MOZSB_CLAUDE_BIN:-}" ]]; then
         AGENT_BIN="$MOZSB_CLAUDE_BIN"
+    elif [[ "$MODE" == "pi" && -n "${MOZSB_PI_BIN:-}" ]]; then
+        AGENT_BIN="$MOZSB_PI_BIN"
     elif [[ "$MODE" == "codex" && -x /opt/homebrew/bin/codex ]]; then
         # Prefer the native Homebrew build on macOS. It avoids exposing a Node
         # runtime and stale npm aliases merely because they occur earlier in
@@ -482,6 +484,18 @@ elif [[ "$MODE" == "codex" ]]; then
     mkdir -p "$CODEX_HOME"
     CODEX_HOME="$(realpath "$CODEX_HOME")"
     PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$CODEX_HOME")))"
+elif [[ "$MODE" == "pi" ]]; then
+    # The agent dir holds auth, settings and sessions, and also the managed
+    # install (launcher and releases). Writes to the code parts are denied so
+    # the sandbox cannot plant code that the host runs later. The Pi
+    # installer's private Node, if present, is read-only.
+    PI_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+    PI_DIR="${PI_DIR/#\~/$HOME}"
+    mkdir -p "$PI_DIR"
+    PI_DIR="$(realpath "$PI_DIR")"
+    PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$PI_DIR")))"
+    PROFILE+=$'\n'"(deny file-write* (subpath $(sb_quote "$PI_DIR/bin")) (subpath $(sb_quote "$PI_DIR/install")))"
+    PROFILE+=$'\n'"(allow file-read* (subpath $(sb_quote "$HOME/.local/share/pi-node")))"
 fi
 
 # npm/fnm installs use a JavaScript shim plus a native package next to it.
@@ -600,6 +614,7 @@ if [[ -n "${SSH_CONNECTION:-}" ]]; then
 fi
 
 [[ "$MODE" == "codex" ]] && ENV_ARGS+=(CODEX_HOME="$CODEX_HOME")
+[[ "$MODE" == "pi" ]] && ENV_ARGS+=(PI_CODING_AGENT_DIR="$PI_DIR")
 [[ "$MODE" == "claude" && -n "${CLAUDE_CONFIG_DIR:-}" ]] && ENV_ARGS+=(CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR")
 
 # Note: we used to forward Claude Code's OAuth token via
@@ -686,7 +701,7 @@ if [[ -f "$_ENV_FILE" ]]; then
         # Note the macOS login caveat at the top of this file: Claude Code
         # also keeps state in ~/.claude.json and the keychain, so moving the
         # config dir here can produce "you are not logged in" prompts.
-        if [[ "$_key" == "CLAUDE_CONFIG_DIR" || "$_key" == "CODEX_HOME" ]]; then
+        if [[ "$_key" == "CLAUDE_CONFIG_DIR" || "$_key" == "CODEX_HOME" || "$_key" == "PI_CODING_AGENT_DIR" ]]; then
             mkdir -p "$_val"
             PROFILE+=$'\n'"(allow file-read* file-write* (subpath $(sb_quote "$(realpath "$_val")")))"
         fi
@@ -743,5 +758,10 @@ case "$MODE" in
         [[ "$_no_daemon" == "1" ]] || CODEX_ARGS+=(--no-daemon)
         env -i "${ENV_ARGS[@]}" sandbox-exec -p "$PROFILE" \
             "$_agent_real" "${CODEX_ARGS[@]}" "$@"
+        ;;
+    pi)
+        # Pi has no sandbox or approval layer of its own, so no flags are needed.
+        env -i "${ENV_ARGS[@]}" sandbox-exec -p "$PROFILE" \
+            "$_agent_real" "$@"
         ;;
 esac
